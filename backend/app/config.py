@@ -315,23 +315,16 @@ class Settings(BaseSettings):
         return f"{scheme}://{auth_part}{self.redis_host}:{self.redis_port}/{self.redis_db}{query}"
 
     @property
-    def db_uri_celery(self) -> str:
-        """Celery/Kombu-friendly Postgres URL (no SQLAlchemy +psycopg driver suffix)."""
-        user = quote(self.db_user, safe="")
-        password = quote(self.db_password.get_secret_value(), safe="")
-        return f"postgresql://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
-
-    @property
     def celery_broker_url(self) -> str:
         if self.ephemeral_backend.strip().lower() == "sql":
-            # SQLAlchemy transport — no Redis required (PreventCare cost path).
-            return f"sqla+{self.db_uri_celery}"
+            # Use SQLAlchemy psycopg v3 driver (matches app db_uri).
+            return f"sqla+{self.db_uri}"
         return self.redis_url
 
     @property
     def celery_result_backend(self) -> str:
         if self.ephemeral_backend.strip().lower() == "sql":
-            return f"db+{self.db_uri_celery}"
+            return f"db+{self.db_uri}"
         return self.redis_url
 
     # Decryptor for encrypted fields
