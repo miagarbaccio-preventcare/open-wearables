@@ -79,8 +79,8 @@ def init_raw_payload_storage(**kwargs) -> None:
 def create_celery() -> Celery:
     celery_app = cast(Celery, current_celery_app)
     celery_app.conf.update(
-        broker_url=settings.redis_url,
-        result_backend=settings.redis_url,
+        broker_url=settings.celery_broker_url,
+        result_backend=settings.celery_result_backend,
         task_serializer="json",
         accept_content=["json"],
         result_serializer="json",
@@ -104,7 +104,8 @@ def create_celery() -> Celery:
 
     # rediss:// alone isn't enough for Celery — the broker/result transports read
     # their TLS requirements from these dicts. Required for ElastiCache (TLS).
-    if settings.redis_ssl:
+    # Skip when PreventCare runs EPHEMERAL_BACKEND=sql (Cloud SQL broker).
+    if settings.ephemeral_backend.strip().lower() != "sql" and settings.redis_ssl:
         ssl_options = {"ssl_cert_reqs": ssl.CERT_REQUIRED}
         celery_app.conf.broker_use_ssl = ssl_options
         celery_app.conf.redis_backend_use_ssl = ssl_options

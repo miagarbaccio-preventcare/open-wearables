@@ -71,7 +71,11 @@ class Settings(BaseSettings):
     # VALIDATION SETTINGS
     min_password_length: int = 8
 
-    # REDIS SETTINGS
+    # REDIS / EPHEMERAL STORE SETTINGS
+    # PreventCare: set ephemeral_backend=sql to eliminate Memorystore Redis for
+    # app state + Celery (broker/result use Cloud SQL via SQLAlchemy/DB backend).
+    # Keep redis_* settings when ephemeral_backend=redis (upstream default).
+    ephemeral_backend: str = "redis"  # "redis" | "sql"
     redis_host: str = "localhost"
     redis_port: int = 6379
     redis_db: int = 0
@@ -309,6 +313,26 @@ class Settings(BaseSettings):
         scheme = "rediss" if self.redis_ssl else "redis"
         query = "?ssl_cert_reqs=required" if self.redis_ssl else ""
         return f"{scheme}://{auth_part}{self.redis_host}:{self.redis_port}/{self.redis_db}{query}"
+
+    @property
+    def db_uri_celery(self) -> str:
+        """Celery/Kombu-friendly Postgres URL (no SQLAlchemy +psycopg driver suffix)."""
+        user = quote(self.db_user, safe="")
+        password = quote(self.db_password.get_secret_value(), safe="")
+        return f"postgresql://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
+
+    @property
+    def celery_broker_url(self) -> str:
+        if self.ephemeral_backend.strip().lower() == "sql":
+            # SQLAlchemy transport — no Redis required (PreventCare cost path).
+            return f"sqla+{self.db_uri_celery}"
+        return self.redis_url
+
+    @property
+    def celery_result_backend(self) -> str:
+        if self.ephemeral_backend.strip().lower() == "sql":
+            return f"db+{self.db_uri_celery}"
+        return self.redis_url
 
     # Decryptor for encrypted fields
     @field_validator("*", mode="after")
