@@ -315,16 +315,24 @@ class Settings(BaseSettings):
         return f"{scheme}://{auth_part}{self.redis_host}:{self.redis_port}/{self.redis_db}{query}"
 
     @property
+    def db_uri_celery(self) -> str:
+        """Celery/Kombu Postgres URL (plain postgresql:// for psycopg2-compatible Celery)."""
+        user = quote(self.db_user, safe="")
+        password = quote(self.db_password.get_secret_value(), safe="")
+        return f"postgresql://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
+
+    @property
     def celery_broker_url(self) -> str:
         if self.ephemeral_backend.strip().lower() == "sql":
-            # Use SQLAlchemy psycopg v3 driver (matches app db_uri).
-            return f"sqla+{self.db_uri}"
+            # sqla+postgresql:// (not +psycopg) — Kombu misparses multiple '+' in the scheme.
+            return f"sqla+{self.db_uri_celery}"
         return self.redis_url
 
     @property
     def celery_result_backend(self) -> str:
         if self.ephemeral_backend.strip().lower() == "sql":
-            return f"db+{self.db_uri}"
+            # Celery DB backend imports psycopg2 for postgresql:// URLs.
+            return f"db+{self.db_uri_celery}"
         return self.redis_url
 
     # Decryptor for encrypted fields
