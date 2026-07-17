@@ -72,10 +72,12 @@ class Settings(BaseSettings):
     min_password_length: int = 8
 
     # REDIS / EPHEMERAL STORE SETTINGS
-    # PreventCare: set ephemeral_backend=sql to eliminate Memorystore Redis for
-    # app state + Celery (broker/result use Cloud SQL via SQLAlchemy/DB backend).
-    # Keep redis_* settings when ephemeral_backend=redis (upstream default).
+    # PreventCare: set ephemeral_backend=sql to store sleep/OAuth/locks/sync-status
+    # in Cloud SQL (ephemeral_kv) instead of Memorystore.
+    # Celery broker/results: set celery_broker_backend=sql once sqla+ broker is
+    # validated; until then keep "redis" (hybrid) so workers stay healthy.
     ephemeral_backend: str = "redis"  # "redis" | "sql"
+    celery_broker_backend: str = "redis"  # "redis" | "sql" (independent of ephemeral)
     redis_host: str = "localhost"
     redis_port: int = 6379
     redis_db: int = 0
@@ -323,14 +325,14 @@ class Settings(BaseSettings):
 
     @property
     def celery_broker_url(self) -> str:
-        if self.ephemeral_backend.strip().lower() == "sql":
+        if self.celery_broker_backend.strip().lower() == "sql":
             # sqla+postgresql:// (not +psycopg) — Kombu misparses multiple '+' in the scheme.
             return f"sqla+{self.db_uri_celery}"
         return self.redis_url
 
     @property
     def celery_result_backend(self) -> str:
-        if self.ephemeral_backend.strip().lower() == "sql":
+        if self.celery_broker_backend.strip().lower() == "sql":
             # Celery DB backend imports psycopg2 for postgresql:// URLs.
             return f"db+{self.db_uri_celery}"
         return self.redis_url

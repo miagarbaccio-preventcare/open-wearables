@@ -104,8 +104,8 @@ def create_celery() -> Celery:
 
     # rediss:// alone isn't enough for Celery — the broker/result transports read
     # their TLS requirements from these dicts. Required for ElastiCache (TLS).
-    # Skip when PreventCare runs EPHEMERAL_BACKEND=sql (Cloud SQL broker).
-    if settings.ephemeral_backend.strip().lower() != "sql" and settings.redis_ssl:
+    # Skip when PreventCare runs Celery on Cloud SQL (celery_broker_backend=sql).
+    if settings.celery_broker_backend.strip().lower() != "sql" and settings.redis_ssl:
         ssl_options = {"ssl_cert_reqs": ssl.CERT_REQUIRED}
         celery_app.conf.broker_use_ssl = ssl_options
         celery_app.conf.redis_backend_use_ssl = ssl_options
