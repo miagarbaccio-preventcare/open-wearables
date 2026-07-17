@@ -6,16 +6,13 @@ This fork (`miagarbaccio-preventcare/open-wearables`) adds an optional
 
 ## What changed
 
-| Concern | Upstream (Redis) | `EPHEMERAL_BACKEND=sql` |
-|--------|------------------|-------------------------|
-| Sleep session state / locks | Redis keys | `ephemeral_kv` table |
-| OAuth CSRF state | Redis | `ephemeral_kv` |
-| Sync coordination locks | Redis | `ephemeral_kv` |
-| Garmin backfill state | Redis | `ephemeral_kv` |
-| Sync-status SSE | Redis lists + pub/sub | `ephemeral_kv` + `ephemeral_pubsub` |
-| Celery broker / results | Redis | SQLAlchemy broker + DB result backend |
+| Concern | Upstream (Redis) | Hybrid (current) | Full SQL (future) |
+|--------|------------------|------------------|-------------------|
+| Sleep / OAuth / locks / sync-status | Redis | `EPHEMERAL_BACKEND=sql` → `ephemeral_kv` | same |
+| Celery broker / results | Redis | `CELERY_BROKER_BACKEND=redis` | `CELERY_BROKER_BACKEND=sql` |
+| Delete Memorystore | — | **not yet** | after Celery SQL proven |
 
-## Enable
+## Enable (hybrid — safe cutover)
 
 1. Deploy this fork (not `the-momentum/open-wearables`).
 2. Run Alembic migrations (creates `ephemeral_kv`, `ephemeral_pubsub`).
@@ -23,14 +20,14 @@ This fork (`miagarbaccio-preventcare/open-wearables`) adds an optional
 
 ```bash
 EPHEMERAL_BACKEND=sql
-# REDIS_* can remain unset / dummy — unused when backend=sql
+CELERY_BROKER_BACKEND=redis
 ```
 
 4. Smoke-test HealthKit sleep ingest + daily `syncOwHealthDaily`.
-5. Only after green for several days: delete Memorystore `open-wearables-redis`
-   and shrink/remove the VPC connector if nothing else needs it.
+5. Later: set `CELERY_BROKER_BACKEND=sql`, confirm Celery beat/worker logs, then
+   delete Memorystore `open-wearables-redis`.
 
-**Do not delete Redis until step 4 is proven.** Code backup alone does not protect live wearables data paths.
+**Do not delete Redis until Celery is on SQL and proven.**
 
 ## Deploy from PreventCare iOSApp repo
 
@@ -44,13 +41,12 @@ branch/tag: `preventcare/redis-free-ephemeral-store` (or `main` after merge).
 
 ## Rollback
 
-Set `EPHEMERAL_BACKEND=redis`, restore Redis host/port secrets, redeploy.
+Set `EPHEMERAL_BACKEND=redis` (and keep `CELERY_BROKER_BACKEND=redis`), redeploy.
 Ephemeral SQL rows are disposable; durable health data remains in Cloud SQL
 domain tables and Firestore (PreventCare).
 
 ## Limits
 
 - `SqlKvClient` implements only the Redis command subset OW uses.
-- Celery over SQLAlchemy is fine for ~small user counts; revisit Cloud Tasks
-  if task volume grows.
-- SSE pub/sub is poll-based via Postgres (slightly higher latency than Redis).
+- Celery over SQLAlchemy still needs production validation before Memorystore removal.
+- SSE pub/sub is poll-based via Postgres when ephemeral is SQL.
