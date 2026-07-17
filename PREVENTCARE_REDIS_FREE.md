@@ -4,49 +4,48 @@ This fork (`miagarbaccio-preventcare/open-wearables`) adds an optional
 **Postgres ephemeral store** so production can run without Memorystore Redis
 (~largest always-on cost for PreventCare’s OW stack).
 
-## What changed
+## Production cutover (2026-07-17)
 
-| Concern | Upstream (Redis) | Hybrid (current) | Full SQL (future) |
-|--------|------------------|------------------|-------------------|
-| Sleep / OAuth / locks / sync-status | Redis | `EPHEMERAL_BACKEND=sql` → `ephemeral_kv` | same |
-| Celery broker / results | Redis | `CELERY_BROKER_BACKEND=redis` | `CELERY_BROKER_BACKEND=sql` |
-| Delete Memorystore | — | **not yet** | after Celery SQL proven |
+| Concern | Setting | Backend |
+|--------|---------|---------|
+| Sleep / OAuth / locks / sync-status | `EPHEMERAL_BACKEND=sql` | `ephemeral_kv` / `ephemeral_pubsub` |
+| Celery broker / results | `CELERY_BROKER_BACKEND=sql` | `sqla+postgresql` / `db+postgresql` |
+| Worker CPU | `cpu-throttling: false` | Required — throttling freezes Celery |
+| Memorystore | still provisioned | Delete only after soak test |
 
-## Enable (hybrid — safe cutover)
+Verified: Celery connected to Cloud SQL; `process_sdk_upload` succeeded.
 
-1. Deploy this fork (not `the-momentum/open-wearables`).
-2. Run Alembic migrations (creates `ephemeral_kv`, `ephemeral_pubsub`).
-3. Set on **API and worker** Cloud Run services:
+## Enable
 
 ```bash
 EPHEMERAL_BACKEND=sql
+CELERY_BROKER_BACKEND=sql
+# Worker must NOT use CPU throttling
+```
+
+## Rollback
+
+```bash
+EPHEMERAL_BACKEND=redis
 CELERY_BROKER_BACKEND=redis
 ```
 
-4. Smoke-test HealthKit sleep ingest + daily `syncOwHealthDaily`.
-5. Later: set `CELERY_BROKER_BACKEND=sql`, confirm Celery beat/worker logs, then
-   delete Memorystore `open-wearables-redis`.
+Then redeploy. Ephemeral SQL rows are disposable.
 
-**Do not delete Redis until Celery is on SQL and proven.**
+## Delete Memorystore (after soak)
+
+Only after several days of healthy sync:
+
+1. Confirm no Redis traffic / no regressions.
+2. Explicit approval to delete `open-wearables-redis`.
+3. Optionally shrink/remove VPC connector if unused.
 
 ## Deploy from PreventCare iOSApp repo
 
-`gcp/open-wearables/cloudbuild.yaml` should clone:
+`gcp/open-wearables/cloudbuild.yaml` clones:
 
 ```text
 https://github.com/miagarbaccio-preventcare/open-wearables.git
 ```
 
-branch/tag: `preventcare/redis-free-ephemeral-store` (or `main` after merge).
-
-## Rollback
-
-Set `EPHEMERAL_BACKEND=redis` (and keep `CELERY_BROKER_BACKEND=redis`), redeploy.
-Ephemeral SQL rows are disposable; durable health data remains in Cloud SQL
-domain tables and Firestore (PreventCare).
-
-## Limits
-
-- `SqlKvClient` implements only the Redis command subset OW uses.
-- Celery over SQLAlchemy still needs production validation before Memorystore removal.
-- SSE pub/sub is poll-based via Postgres when ephemeral is SQL.
+branch: `preventcare/redis-free-ephemeral-store`
