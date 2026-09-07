@@ -142,8 +142,15 @@ class TimeSeriesService(
         user_id: UUID,
         types: list[SeriesType],
         params: TimeSeriesQueryParams,
+        include_total: bool = False,
     ) -> PaginatedResponse[TimeSeriesSample]:
-        samples, total_count = self.crud.get_samples(db_session, params, types, user_id)
+        samples, total_count = self.crud.get_samples(
+            db_session,
+            params,
+            types,
+            user_id,
+            include_total=include_total,
+        )
 
         limit = params.limit or 50
         has_more = len(samples) > limit

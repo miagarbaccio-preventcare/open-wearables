@@ -269,11 +269,14 @@ class DataPointSeriesRepository(
         params: TimeSeriesQueryParams,
         types: list[SeriesType],
         user_id: UUID,
-    ) -> tuple[list[tuple[DataPointSeries, DataSource]], int]:
+        include_total: bool = False,
+    ) -> tuple[list[tuple[DataPointSeries, DataSource]], int | None]:
         """Get data points with filtering and keyset pagination.
 
-        Returns a tuple of (samples, total_count) where total_count is calculated
-        BEFORE applying cursor pagination, giving the total number of matching records.
+        Returns a tuple of (samples, total_count). ``total_count`` is ``None``
+        unless ``include_total`` is set: it is a COUNT(*) over the whole filtered
+        join, so computing it on every page turns an O(limit) keyset scan into a
+        full scan per page. Crawlers that walk every cursor do not need it.
         """
         query = (
             db_session.query(self.model, DataSource)
@@ -307,7 +310,7 @@ class DataPointSeriesRepository(
 
         # Calculate total count BEFORE applying cursor pagination
         # This gives us the total matching records (after all other filters)
-        total_count = query.count()
+        total_count = query.count() if include_total else None
 
         # Cursor pagination (keyset)
         if params.cursor:

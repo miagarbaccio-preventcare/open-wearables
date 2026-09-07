@@ -25,6 +25,10 @@ def get_timeseries(
     resolution: Literal["raw", "1min", "5min", "15min", "1hour"] = "raw",
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    include_total: Annotated[
+        bool,
+        Query(description="Include total_count. Costs a COUNT(*) over the whole window."),
+    ] = False,
 ) -> PaginatedResponse[TimeSeriesSample]:
     """Returns granular time series data (biometrics or activity)."""
     params = TimeSeriesQueryParams(
@@ -33,4 +37,4 @@ def get_timeseries(
         limit=limit,
         cursor=cursor,
     )
-    return timeseries_service.get_timeseries(db, user_id, types, params)
+    return timeseries_service.get_timeseries(db, user_id, types, params, include_total=include_total)
