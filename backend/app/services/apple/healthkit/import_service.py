@@ -359,8 +359,15 @@ class ImportService:
             # Load data and get saved counts
             saved_counts = self.load_data(db_session, data, user_id=user_id, batch_id=batch_id)
 
+            items_saved = (
+                int(saved_counts.get("records_saved") or 0)
+                + int(saved_counts.get("workouts_saved") or 0)
+                + int(saved_counts.get("sleep_saved") or 0)
+            )
             connection = self.user_connection_repo.get_by_user_and_provider(db_session, UUID(user_id), provider)
-            if connection:
+            # Empty incremental pings used to stamp last_synced_at and hide
+            # dropped HealthKit batches (July 2026 collection cliff).
+            if connection and items_saved > 0:
                 self.user_connection_repo.update_last_synced_at(db_session, connection)
 
             # Log detailed processing results

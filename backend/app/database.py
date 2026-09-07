@@ -27,15 +27,27 @@ from app.schemas.enums import AggregationMethod, HealthScoreCategory, ProviderNa
 from app.schemas.model_crud.user_management import InvitationStatus
 from app.utils.mappings_meta import AutoRelMeta
 
+# Shared-core Cloud SQL (db-g1-small) cannot absorb the old 20+30 pool
+# per API/worker/drain process. Keep a small pool on both engines.
+_POOL_SIZE = 3
+_MAX_OVERFLOW = 2
+
 engine = create_engine(
     settings.db_uri,
     pool_pre_ping=True,
-    pool_size=20,
-    max_overflow=30,
+    pool_size=_POOL_SIZE,
+    max_overflow=_MAX_OVERFLOW,
     pool_timeout=30,
     pool_recycle=3600,
 )
-async_engine = create_async_engine(settings.db_uri)
+async_engine = create_async_engine(
+    settings.db_uri,
+    pool_pre_ping=True,
+    pool_size=_POOL_SIZE,
+    max_overflow=_MAX_OVERFLOW,
+    pool_timeout=30,
+    pool_recycle=3600,
+)
 
 
 def _prepare_sessionmaker(engine: Engine) -> sessionmaker:
