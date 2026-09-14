@@ -5,7 +5,9 @@ from uuid import UUID
 from psycopg.errors import UniqueViolation
 from sqlalchemy import ColumnElement, Date, Interval, String, and_, asc, case, cast, func, literal_column, text, tuple_
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.engine import Row
 from sqlalchemy.exc import IntegrityError as SQLAIntegrityError
+from sqlalchemy.orm import Query
 
 from app.database import DbSession
 from app.models import DataPointSeries, DataSource, DeviceTypePriority, ProviderPriority
@@ -26,13 +28,33 @@ from app.schemas.model_crud.activities import (
 from app.schemas.responses.activity import (
     ActiveMinutesResult,
     ActivityAggregateResult,
+    BucketedSampleResult,
     IntensityMinutesResult,
 )
 from app.utils.exceptions import handle_exceptions
-from app.utils.pagination import decode_cursor
+from app.utils.pagination import decode_bucket_cursor, decode_cursor
 
 # Identity tuple: (user_id, device_model, source)
 DataSourceIdentity = tuple[UUID, str | None, str | None]
+
+
+def _to_bucket(row: Row) -> BucketedSampleResult:
+    """Map one aggregated row to a bucket.
+
+    The aggregates are never NULL: ``value`` is NOT NULL and a group exists only
+    because it has at least one row, so sum/avg/max are all defined.
+    """
+    return BucketedSampleResult(
+        bucket_start=row.bucket_start,
+        series_type_definition_id=row.series_type_definition_id,
+        data_source_id=row.data_source_id,
+        source=row.source,
+        device_model=row.device_model,
+        zone_offset=row.zone_offset,
+        sum_value=float(row.sum_value),
+        avg_value=float(row.avg_value),
+        max_value=float(row.max_value),
+    )
 
 
 class WriteCounts(int):
@@ -338,6 +360,178 @@ class DataPointSeriesRepository(
         # Limit + 1 to check for next page
         limit = params.limit or 50
         return query.limit(limit + 1).all(), total_count  # ty:ignore[invalid-return-type]
+
+    def get_bucketed_samples(
+        self,
+        db_session: DbSession,
+        params: TimeSeriesQueryParams,
+        types: list[SeriesType],
+        user_id: UUID,
+        bucket_seconds: int,
+        include_total: bool = False,
+    ) -> tuple[list[BucketedSampleResult], int | None]:
+        """Aggregate samples into fixed-width buckets with keyset pagination.
+
+        Grouped by (bucket_start, series type, data source) so a device's samples
+        are never blended with another's, and so each group holds exactly one
+        series type — which lets the caller apply that type's AggregationMethod
+        to the right column instead of pushing a per-type CASE into SQL.
+
+        Rows flagged ``is_daily_total`` are excluded: a provider-reported daily
+        total describes a whole day, so folding it into the sub-daily bucket that
+        happens to contain its timestamp would report a day's steps as one hour's
+        and, because the daily-preference rule would then shadow that hour's real
+        samples, double-count the day. Daily totals stay the summaries endpoint's
+        job; this endpoint reports intraday shape only.
+
+        Buckets are floored on the UTC epoch, matching the raw path's UTC
+        timestamps, so a caller that maps buckets onto local days keeps doing its
+        own conversion. Exact for whole-hour UTC offsets; a zone on a :30 or :45
+        offset has its local hour split across two buckets.
+
+        Returns ``limit + 1`` buckets so the caller can detect a further page.
+        Paging is a HAVING keyset on the same (bucket_start, series type, data
+        source) tuple the rows are ordered by, narrowed first by a range filter
+        on ``recorded_at``: a bucket is defined entirely by the rows inside it,
+        so rows before the cursor's bucket cannot contribute to a later one. The
+        row filter is what keeps this bounded — without it every bucket in the
+        window would be built to return one page, and since a bucket cannot
+        outnumber its own source rows, a fine resolution over a long window would
+        approach holding the whole raw window in memory.
+
+        The grouping needs no index of its own, measured rather than assumed. On
+        2.8M rows (20 users, a year of 5-minute heart rate and 15-minute steps,
+        deliberately interleaved across users so heap locality is worse than a
+        real per-user import), a 21-day window over three types costs 17ms, and
+        the nine such windows a 180-day crawl issues cost 176ms in total. The
+        bucket key is an expression, so an expression index would be needed per
+        resolution, and the group key reaches into the joined table — while a
+        covering ``INCLUDE (value, zone_offset, is_daily_total)`` index does make
+        the scan index-only and cuts a window to 6ms, that is 90ms across a whole
+        crawl in exchange for a third index on the leading columns of one already
+        carrying the uniqueness constraint, on a table the SDK writes constantly.
+        Chunk the window before reaching for an index: one unchunked 180-day call
+        costs 97ms, 62ms of it heap access the chunked shape never pays.
+        """
+        bucket_start = func.to_timestamp(
+            func.floor(func.extract("epoch", self.model.recorded_at) / bucket_seconds) * bucket_seconds
+        )
+        # Grouped and ordered on the expression itself, not the output alias:
+        # Postgres would accept the alias here, but it would silently bind to a
+        # real column if one named bucket_start ever appeared on either table.
+        group_by = (
+            bucket_start,
+            self.model.series_type_definition_id,
+            self.model.data_source_id,
+            DataSource.source,
+            DataSource.device_model,
+        )
+        sort_key = (bucket_start, self.model.series_type_definition_id, self.model.data_source_id)
+
+        def apply_filters(query: Query) -> Query:
+            query = query.join(
+                DataSource,
+                self.model.data_source_id == DataSource.id,
+            ).filter(
+                DataSource.user_id == user_id,
+                self.model.is_daily_total.isnot(True),
+            )
+
+            if types:
+                type_ids = [get_series_type_id(t) for t in types]
+                query = query.filter(self.model.series_type_definition_id.in_(type_ids))
+
+            if params.device_model:
+                query = query.filter(DataSource.device_model == params.device_model)
+
+            if params.source:
+                query = query.filter(DataSource.source == params.source)
+
+            if params.start_datetime:
+                query = query.filter(self.model.recorded_at >= params.start_datetime)
+
+            if params.end_datetime:
+                # Same date-only widening as get_samples: a bare date means the whole day.
+                end_dt = params.end_datetime
+                if end_dt.time() == time.min:
+                    end_dt = end_dt + timedelta(days=1)
+                query = query.filter(self.model.recorded_at < end_dt)
+
+            return query
+
+        # Counted before the cursor filter, like get_samples, so it describes the
+        # whole window rather than the page. Needs its own pass over the groups,
+        # hence opt-in.
+        total_count = None
+        if include_total:
+            groups = (
+                apply_filters(db_session.query(bucket_start.label("bucket_start"), *group_by[1:]))
+                .group_by(*group_by)
+                .subquery()
+            )
+            total_count = db_session.query(func.count()).select_from(groups).scalar()
+
+        query = apply_filters(
+            db_session.query(
+                bucket_start.label("bucket_start"),
+                self.model.series_type_definition_id.label("series_type_definition_id"),
+                self.model.data_source_id.label("data_source_id"),
+                DataSource.source.label("source"),
+                DataSource.device_model.label("device_model"),
+                # One offset per bucket. It is a property of the recording device,
+                # so it is the same for every row here except across a DST change,
+                # where min() breaks the tie by string order.
+                func.min(self.model.zone_offset).label("zone_offset"),
+                func.sum(self.model.value).label("sum_value"),
+                func.avg(self.model.value).label("avg_value"),
+                func.max(self.model.value).label("max_value"),
+            )
+        )
+
+        limit = params.limit or 50
+
+        if params.cursor:
+            cursor_start, cursor_type_id, cursor_source_id, direction = decode_bucket_cursor(params.cursor)
+            cursor_key = (cursor_start, cursor_type_id, cursor_source_id)
+
+            if direction == "prev":
+                # Backward: only rows in the cursor's own bucket or earlier can
+                # form an earlier bucket.
+                rows = (
+                    query.filter(self.model.recorded_at < cursor_start + timedelta(seconds=bucket_seconds))
+                    .group_by(*group_by)
+                    .having(tuple_(*sort_key) < cursor_key)
+                    .order_by(
+                        bucket_start.desc(),
+                        self.model.series_type_definition_id.desc(),
+                        self.model.data_source_id.desc(),
+                    )
+                    .limit(limit + 1)
+                    .all()
+                )
+                # Hand back ascending; the extra row for has_more sits at the front.
+                return [_to_bucket(row) for row in reversed(rows)], total_count
+
+            # Forward: rows before the cursor's bucket cannot form a later one.
+            grouped = (
+                query.filter(self.model.recorded_at >= cursor_start)
+                .group_by(*group_by)
+                .having(tuple_(*sort_key) > cursor_key)
+            )
+        else:
+            grouped = query.group_by(*group_by)
+
+        rows = (
+            grouped.order_by(
+                asc(bucket_start),
+                asc(self.model.series_type_definition_id),
+                asc(self.model.data_source_id),
+            )
+            .limit(limit + 1)
+            .all()
+        )
+
+        return [_to_bucket(row) for row in rows], total_count
 
     def get_total_count(self, db_session: DbSession) -> int:
         """Get total count of all data points."""

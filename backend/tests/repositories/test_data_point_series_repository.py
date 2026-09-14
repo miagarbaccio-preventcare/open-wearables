@@ -174,7 +174,9 @@ class TestDataPointSeriesRepository:
         query_params = TimeSeriesQueryParams()
 
         # Act
-        results, total_count = series_repo.get_samples(db, query_params, [SeriesType.heart_rate], user.id)
+        results, total_count = series_repo.get_samples(
+            db, query_params, [SeriesType.heart_rate], user.id, include_total=True
+        )
 
         # Assert
         assert results == []  # Returns empty list when no device filter provided
@@ -219,7 +221,9 @@ class TestDataPointSeriesRepository:
         query_params = TimeSeriesQueryParams(device_model="device1")
 
         # Act
-        results, total_count = series_repo.get_samples(db, query_params, [SeriesType.heart_rate], user.id)
+        results, total_count = series_repo.get_samples(
+            db, query_params, [SeriesType.heart_rate], user.id, include_total=True
+        )
 
         # Assert
         assert len(results) == 3
@@ -253,7 +257,9 @@ class TestDataPointSeriesRepository:
         query_params = TimeSeriesQueryParams(data_source_id=mapping.id)
 
         # Act
-        results, total_count = series_repo.get_samples(db, query_params, [SeriesType.heart_rate], user.id)
+        results, total_count = series_repo.get_samples(
+            db, query_params, [SeriesType.heart_rate], user.id, include_total=True
+        )
 
         # Assert
         assert len(results) == 3
@@ -298,7 +304,9 @@ class TestDataPointSeriesRepository:
         query_params = TimeSeriesQueryParams(device_model="device1")
 
         # Act
-        results, total_count = series_repo.get_samples(db, query_params, [SeriesType.heart_rate], user.id)
+        results, total_count = series_repo.get_samples(
+            db, query_params, [SeriesType.heart_rate], user.id, include_total=True
+        )
 
         # Assert
         assert len(results) == 2
@@ -345,7 +353,9 @@ class TestDataPointSeriesRepository:
         )
 
         # Act
-        results, total_count = series_repo.get_samples(db, query_params, [SeriesType.heart_rate], user.id)
+        results, total_count = series_repo.get_samples(
+            db, query_params, [SeriesType.heart_rate], user.id, include_total=True
+        )
 
         # Assert - should get yesterday and now (2 samples), excluding two_days_ago
         assert len(results) == 2
@@ -391,7 +401,9 @@ class TestDataPointSeriesRepository:
         query_params = TimeSeriesQueryParams(device_model="device1", source="apple")
 
         # Act
-        results, total_count = series_repo.get_samples(db, query_params, [SeriesType.heart_rate], user.id)
+        results, total_count = series_repo.get_samples(
+            db, query_params, [SeriesType.heart_rate], user.id, include_total=True
+        )
 
         # Assert
         assert len(results) == 1
@@ -424,7 +436,9 @@ class TestDataPointSeriesRepository:
         query_params = TimeSeriesQueryParams(device_model="device1")
 
         # Act
-        results, total_count = series_repo.get_samples(db, query_params, [SeriesType.heart_rate], user.id)
+        results, total_count = series_repo.get_samples(
+            db, query_params, [SeriesType.heart_rate], user.id, include_total=True
+        )
 
         # Assert
         assert len(results) >= 3
@@ -448,6 +462,50 @@ class TestDataPointSeriesRepository:
 
         # Assert
         assert len(results) <= 1000
+
+    def test_get_samples_total_count_is_opt_in(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
+        """total_count is None unless asked for, and correct when it is.
+
+        It is a COUNT(*) over the whole filtered join, so computing it on every
+        page turns an O(limit) keyset scan into a full scan — that cost put the
+        timeseries endpoint at an 82s p50 before it was made opt-in. The rows
+        must come back either way; only the count is conditional.
+        """
+        # Arrange
+        user = UserFactory()
+        mapping = DataSourceFactory(user=user, device_model="device1")
+        now = datetime.now(timezone.utc)
+
+        for i in range(3):
+            series_repo.create(
+                db,
+                TimeSeriesSampleCreate(
+                    id=uuid4(),
+                    user_id=user.id,
+                    source="apple",
+                    device_model="device1",
+                    data_source_id=mapping.id,
+                    recorded_at=now - timedelta(hours=i),
+                    value=70 + i,
+                    series_type=SeriesType.heart_rate,
+                ),
+            )
+
+        query_params = TimeSeriesQueryParams(device_model="device1")
+
+        # Act
+        default_results, default_total = series_repo.get_samples(db, query_params, [SeriesType.heart_rate], user.id)
+        counted_results, counted_total = series_repo.get_samples(
+            db, query_params, [SeriesType.heart_rate], user.id, include_total=True
+        )
+
+        # Assert — no count by default, but the same rows
+        assert default_total is None
+        assert len(default_results) == 3
+
+        # Assert — opting in returns the real count
+        assert counted_total == 3
+        assert len(counted_results) == 3
 
     def test_get_total_count(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
         """Test counting total data points."""
@@ -681,7 +739,9 @@ class TestDataPointSeriesRepository:
         query_params = TimeSeriesQueryParams(device_model="device1")
 
         # Act
-        results, total_count = series_repo.get_samples(db, query_params, [SeriesType.heart_rate], user1.id)
+        results, total_count = series_repo.get_samples(
+            db, query_params, [SeriesType.heart_rate], user1.id, include_total=True
+        )
 
         # Assert
         assert len(results) == 2

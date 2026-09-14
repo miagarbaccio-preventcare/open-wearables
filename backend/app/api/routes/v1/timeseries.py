@@ -22,9 +22,33 @@ def get_timeseries(
     db: DbSession,
     _api_key: ApiKeyDep,
     types: Annotated[list[SeriesType], Query()] = [],
-    resolution: Literal["raw", "1min", "5min", "15min", "1hour"] = "raw",
+    resolution: Annotated[
+        Literal["raw", "1min", "5min", "15min", "1hour"],
+        Query(
+            description=(
+                "Bucket size. `raw` returns individual samples; any other value "
+                "aggregates each (bucket, type, device) with that type's method "
+                "(sum for cumulative types, average for rates, max for peaks) and "
+                "excludes provider daily totals, which belong to a whole day "
+                "rather than one bucket. `metadata.resolution` reports the "
+                "resolution actually applied. Bucket cursors are not "
+                "interchangeable with raw cursors."
+            ),
+        ),
+    ] = "raw",
     cursor: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=1000,
+            description=(
+                "Page size. Matches the 1000 the query schema already allowed; the "
+                "route was the tighter of the two, which made a wide window cost "
+                "ten times the round trips it needed."
+            ),
+        ),
+    ] = 50,
     include_total: Annotated[
         bool,
         Query(description="Include total_count. Costs a COUNT(*) over the whole window."),
@@ -37,4 +61,11 @@ def get_timeseries(
         limit=limit,
         cursor=cursor,
     )
-    return timeseries_service.get_timeseries(db, user_id, types, params, include_total=include_total)
+    return timeseries_service.get_timeseries(
+        db,
+        user_id,
+        types,
+        params,
+        include_total=include_total,
+        requested_resolution=resolution,
+    )

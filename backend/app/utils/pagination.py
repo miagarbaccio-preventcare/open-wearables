@@ -174,6 +174,54 @@ def process_paginated_results(
     )
 
 
+# Namespace tag for downsampled-bucket cursors. A raw-sample cursor encodes
+# (recorded_at, row id) and a bucket cursor encodes (bucket_start, series type,
+# data source); resuming one walk with the other's cursor would silently skip or
+# repeat rows, so the tag makes the mismatch an InvalidCursorError instead.
+_BUCKET_CURSOR_TAG = "bucket_v1"
+
+
+def encode_bucket_cursor(
+    bucket_start: datetime,
+    series_type_definition_id: int,
+    data_source_id: UUID,
+    direction: str = "next",
+) -> str:
+    """Encode a cursor for one downsampled bucket.
+
+    Buckets are keyed by (bucket_start, series type, data source), so all three
+    parts are needed: several types and devices share a bucket_start, and a
+    cursor on the timestamp alone would drop the rest of a straddled bucket.
+    """
+    return _encode_cursor_fields(
+        [
+            _BUCKET_CURSOR_TAG,
+            bucket_start.isoformat(),
+            str(series_type_definition_id),
+            str(data_source_id),
+        ],
+        direction,
+    )
+
+
+def decode_bucket_cursor(cursor: str) -> tuple[datetime, int, UUID, str]:
+    """Decode a bucket cursor to its sort key and direction.
+
+    Raises:
+        InvalidCursorError: If the cursor is malformed or is not a bucket cursor
+            (for example a raw-sample cursor passed to the bucketed path).
+    """
+    fields, direction = _decode_cursor_fields(cursor)
+    if len(fields) != 4 or fields[0] != _BUCKET_CURSOR_TAG:
+        raise InvalidCursorError(cursor=cursor)
+
+    try:
+        bucket_start = parse_query_datetime(fields[1])
+        return bucket_start, int(fields[2]), UUID(fields[3]), direction
+    except (ValueError, TypeError):
+        raise InvalidCursorError(cursor=cursor)
+
+
 def encode_date_cursor(cursor_date: date, direction: str = "next") -> str:
     """Encode a date-based cursor for date-keyed pagination.
 

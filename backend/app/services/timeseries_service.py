@@ -1,5 +1,6 @@
 import threading
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import datetime
 from logging import Logger, getLogger
 from typing import Any
@@ -12,7 +13,9 @@ from app.models import DataPointSeries
 from app.repositories import DataPointSeriesRepository
 from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.enums import (
+    AggregationMethod,
     SeriesType,
+    get_aggregation_method,
     get_series_type_from_id,
     get_series_type_unit,
 )
@@ -23,7 +26,7 @@ from app.schemas.model_crud.activities import (
     TimeSeriesSampleCreate,
     TimeSeriesSampleUpdate,
 )
-from app.schemas.responses.activity import TimeSeriesSample
+from app.schemas.responses.activity import BucketedSampleResult, TimeSeriesSample
 from app.schemas.utils import (
     PaginatedResponse,
     Pagination,
@@ -34,7 +37,33 @@ from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.events import on_timeseries_batch_saved
 from app.services.services import AppService
 from app.utils.exceptions import handle_exceptions
-from app.utils.pagination import encode_cursor
+from app.utils.pagination import encode_bucket_cursor, encode_cursor
+
+# Bucket width per requested resolution. "raw" is absent on purpose: a missing
+# entry is what selects the unaggregated path.
+BUCKET_SECONDS_BY_RESOLUTION: dict[str, int] = {
+    "1min": 60,
+    "5min": 300,
+    "15min": 900,
+    "1hour": 3600,
+}
+
+# Which aggregate column represents a bucket, per the series type's archiving
+# method: cumulative types sum, rate/level types average, peak types take the max.
+_BUCKET_VALUE_BY_METHOD: dict[AggregationMethod, Callable[[BucketedSampleResult], float]] = {
+    AggregationMethod.SUM: lambda bucket: bucket["sum_value"],
+    AggregationMethod.AVG: lambda bucket: bucket["avg_value"],
+    AggregationMethod.MAX: lambda bucket: bucket["max_value"],
+}
+
+
+def _bucket_key(bucket: BucketedSampleResult) -> tuple[datetime, int, UUID]:
+    """Sort/cursor key for a bucket, matching the repository's ORDER BY."""
+    return (
+        bucket["bucket_start"],
+        bucket["series_type_definition_id"],
+        bucket["data_source_id"],
+    )
 
 
 class TimeSeriesService(
@@ -143,7 +172,25 @@ class TimeSeriesService(
         types: list[SeriesType],
         params: TimeSeriesQueryParams,
         include_total: bool = False,
+        requested_resolution: str = "raw",
     ) -> PaginatedResponse[TimeSeriesSample]:
+        """Return samples for ``types`` in the ``params`` window.
+
+        ``requested_resolution`` selects raw samples or server-side buckets;
+        ``metadata.resolution`` always reports what was actually applied.
+        """
+        bucket_seconds = BUCKET_SECONDS_BY_RESOLUTION.get(requested_resolution)
+        if bucket_seconds is not None:
+            return self._get_bucketed_timeseries(
+                db_session,
+                user_id,
+                types,
+                params,
+                resolution=requested_resolution,
+                bucket_seconds=bucket_seconds,
+                include_total=include_total,
+            )
+
         samples, total_count = self.crud.get_samples(
             db_session,
             params,
@@ -220,6 +267,95 @@ class TimeSeriesService(
                 total_count=total_count,
             ),
             metadata=TimeseriesMetadata(
+                resolution="raw",
+                sample_count=len(data),
+                start_time=params.start_datetime,
+                end_time=params.end_datetime,
+            ),
+        )
+
+    def _get_bucketed_timeseries(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        types: list[SeriesType],
+        params: TimeSeriesQueryParams,
+        resolution: str,
+        bucket_seconds: int,
+        include_total: bool,
+    ) -> PaginatedResponse[TimeSeriesSample]:
+        """Return one sample per (bucket, series type, data source).
+
+        Aggregation is what makes a wide window affordable: a caller that needs
+        six months of hourly shape gets a few thousand buckets instead of the
+        hundreds of paged round-trips the raw path would take to cover the same
+        span. The repository pages the buckets themselves, so response size and
+        memory stay tied to the page rather than to the window.
+        """
+        buckets, total_count = self.crud.get_bucketed_samples(
+            db_session,
+            params,
+            types,
+            user_id,
+            bucket_seconds=bucket_seconds,
+            include_total=include_total,
+        )
+
+        limit = params.limit or 50
+        is_backward = bool(params.cursor and params.cursor.startswith("prev_"))
+
+        has_more = len(buckets) > limit
+        if has_more:
+            # The repository returns buckets ascending either way, so the extra
+            # row marking a further page is at the front when paging backward.
+            buckets = buckets[-limit:] if is_backward else buckets[:limit]
+
+        # Cursor rules mirror the raw path so a caller's paging loop behaves the
+        # same at either resolution.
+        next_cursor = None
+        previous_cursor = None
+        if buckets:
+            if has_more:
+                next_cursor = encode_bucket_cursor(*_bucket_key(buckets[-1]))
+            if params.cursor and (has_more or not is_backward):
+                previous_cursor = encode_bucket_cursor(*_bucket_key(buckets[0]), direction="prev")
+
+        data = []
+        for bucket in buckets:
+            series_type = get_series_type_from_id(bucket["series_type_definition_id"])
+            method = get_aggregation_method(series_type)
+
+            source = None
+            if bucket["source"] or bucket["device_model"]:
+                source = SourceMetadata(
+                    provider=bucket["source"] or "unknown",
+                    device=bucket["device_model"],
+                )
+
+            data.append(
+                TimeSeriesSample(
+                    timestamp=bucket["bucket_start"],
+                    zone_offset=bucket["zone_offset"],
+                    type=series_type,
+                    value=_BUCKET_VALUE_BY_METHOD[method](bucket),
+                    unit=get_series_type_unit(series_type),
+                    source=source,
+                    # A bucket aggregates intraday samples only; daily totals are
+                    # excluded upstream, so no bucket is ever a daily total.
+                    is_daily_total=False,
+                )
+            )
+
+        return PaginatedResponse(
+            data=data,
+            pagination=Pagination(
+                has_more=has_more,
+                next_cursor=next_cursor,
+                previous_cursor=previous_cursor,
+                total_count=total_count,
+            ),
+            metadata=TimeseriesMetadata(
+                resolution=resolution,  # ty:ignore[invalid-argument-type]
                 sample_count=len(data),
                 start_time=params.start_datetime,
                 end_time=params.end_datetime,

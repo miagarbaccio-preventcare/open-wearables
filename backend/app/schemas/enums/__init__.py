@@ -2,6 +2,7 @@ from .aggregation_method import (
     AGGREGATION_METHOD_BY_TYPE,
     AggregationMethod,
     daily_total_flag,
+    get_aggregation_method,
 )
 from .device_type import (
     DEFAULT_DEVICE_TYPE_PRIORITY,
@@ -35,6 +36,7 @@ __all__ = [
     "AggregationMethod",
     "AGGREGATION_METHOD_BY_TYPE",
     "daily_total_flag",
+    "get_aggregation_method",
     "SeriesType",
     "SERIES_TYPE_DEFINITIONS",
     "SERIES_TYPE_ID_BY_ENUM",

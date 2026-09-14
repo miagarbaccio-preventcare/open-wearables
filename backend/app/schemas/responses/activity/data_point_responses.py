@@ -1,5 +1,6 @@
 from datetime import date, datetime
 from typing import TypedDict
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -18,6 +19,29 @@ class TimeSeriesSample(BaseModel):
     # True = daily total. False/None = not a daily total (summable sample); None is a
     # legacy row and is treated as False by the aggregation.
     is_daily_total: bool | None = None
+
+
+class BucketedSampleResult(TypedDict):
+    """One downsampled bucket, keyed by (bucket_start, series type, data source).
+
+    The repository returns every aggregate column and the service picks the one
+    that matches the series type's ``AggregationMethod`` — grouping by series
+    type means each row belongs to exactly one type, so a single query can serve
+    SUM, AVG and MAX types without a per-type CASE.
+
+    The aggregates are non-optional: ``value`` is NOT NULL and a group exists
+    only because it has at least one row.
+    """
+
+    bucket_start: datetime
+    series_type_definition_id: int
+    data_source_id: UUID
+    source: str | None
+    device_model: str | None
+    zone_offset: str | None
+    sum_value: float
+    avg_value: float
+    max_value: float
 
 
 class ActivityAggregateResult(TypedDict):

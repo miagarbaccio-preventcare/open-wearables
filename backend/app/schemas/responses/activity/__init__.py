@@ -1,6 +1,7 @@
 from .data_point_responses import (
     ActiveMinutesResult,
     ActivityAggregateResult,
+    BucketedSampleResult,
     IntensityMinutesResult,
     TimeSeriesSample,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "TimeSeriesSample",
     "ActivityAggregateResult",
     "ActiveMinutesResult",
+    "BucketedSampleResult",
     "IntensityMinutesResult",
     # Events
     "Workout",
