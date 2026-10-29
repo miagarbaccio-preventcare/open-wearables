@@ -3,6 +3,7 @@ from logging import getLogger
 
 from fastapi import APIRouter, HTTPException, status
 
+from app.config import settings
 from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_upload
 from app.schemas.providers.mobile_sdk import SyncRequest
 from app.schemas.responses.upload import UploadDataResponse
@@ -97,12 +98,34 @@ def sync_sdk_data(
         trace_id=batch_id,
     )
 
-    process_sdk_upload.delay(
-        content=content_str,
-        content_type="application/json",
-        user_id=user_id,
-        provider=provider,
-        batch_id=batch_id,
-    )
+    task_kwargs = {
+        "content": content_str,
+        "content_type": "application/json",
+        "user_id": user_id,
+        "provider": provider,
+        "batch_id": batch_id,
+    }
+
+    total_items = records_count + workouts_count + sleep_count
+    if 0 < total_items <= settings.sdk_inline_max_items:
+        # Small batches import now: the queued path waits for a worker or a
+        # drain job to start, which is most of a new account's first-sync
+        # delay. Any exception falls through to the queue so the batch is
+        # not lost.
+        try:
+            process_sdk_upload(**task_kwargs)
+            return UploadDataResponse(status_code=202, response="Import completed", user_id=user_id)
+        except Exception:
+            log_structured(
+                logger,
+                "warning",
+                "Inline SDK import failed; queueing",
+                action=f"{provider}_sdk_inline_failed",
+                batch_id=batch_id,
+                user_id=user_id,
+                provider=provider,
+            )
+
+    process_sdk_upload.delay(**task_kwargs)
 
     return UploadDataResponse(status_code=202, response="Import task queued successfully", user_id=user_id)
