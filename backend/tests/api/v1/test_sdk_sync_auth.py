@@ -3,6 +3,7 @@
 from collections.abc import Generator
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
@@ -86,6 +87,84 @@ class TestSDKSyncWithSDKToken:
         )
 
         assert response.status_code == 401
+
+
+def _resting_hr_records(count: int) -> list[dict]:
+    return [
+        {
+            "type": "HKQuantityTypeIdentifierRestingHeartRate",
+            "startDate": f"2026-06-{day:02d}T07:00:00Z",
+            "endDate": f"2026-06-{day:02d}T07:00:00Z",
+            "value": 58,
+            "unit": "count/min",
+        }
+        for day in range(1, count + 1)
+    ]
+
+
+class TestSDKSyncInlineImport:
+    """Small batches import in the request; the rest are queued."""
+
+    def _post(self, client: TestClient, api_v1_prefix: str, records: list[dict]) -> httpx.Response:
+        api_key = ApiKeyFactory()
+        user_id = "123e4567-e89b-12d3-a456-426614174000"
+        return client.post(
+            f"{api_v1_prefix}/sdk/users/{user_id}/sync/",
+            headers={"X-Open-Wearables-API-Key": api_key.id},
+            json={
+                "provider": "apple",
+                "sdkVersion": "1.0.0",
+                "syncTimestamp": "2026-06-15T12:00:00Z",
+                "data": {"records": records, "sleep": [], "workouts": []},
+            },
+        )
+
+    def test_a_small_batch_imports_without_the_queue(
+        self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
+    ) -> None:
+        with patch("app.api.routes.v1.sdk_sync.store_raw_payload"):
+            response = self._post(client, api_v1_prefix, _resting_hr_records(3))
+
+        assert response.status_code == 202
+        assert response.json()["response"] == "Import completed"
+        mock_celery_tasks.assert_called_once()
+        assert mock_celery_tasks.call_args.kwargs["provider"] == "apple"
+        mock_celery_tasks.delay.assert_not_called()
+
+    def test_a_failed_inline_import_is_queued_instead(
+        self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
+    ) -> None:
+        mock_celery_tasks.side_effect = RuntimeError("db down")
+        with patch("app.api.routes.v1.sdk_sync.store_raw_payload"):
+            response = self._post(client, api_v1_prefix, _resting_hr_records(3))
+
+        assert response.status_code == 202
+        assert response.json()["response"] == "Import task queued successfully"
+        mock_celery_tasks.delay.assert_called_once()
+        assert mock_celery_tasks.delay.call_args.kwargs == mock_celery_tasks.call_args.kwargs
+
+    def test_a_batch_over_the_limit_is_queued(
+        self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
+    ) -> None:
+        with (
+            patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
+            patch("app.api.routes.v1.sdk_sync.settings.sdk_inline_max_items", 2),
+        ):
+            response = self._post(client, api_v1_prefix, _resting_hr_records(3))
+
+        assert response.status_code == 202
+        mock_celery_tasks.assert_not_called()
+        mock_celery_tasks.delay.assert_called_once()
+
+    def test_an_empty_batch_is_queued(
+        self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
+    ) -> None:
+        with patch("app.api.routes.v1.sdk_sync.store_raw_payload"):
+            response = self._post(client, api_v1_prefix, [])
+
+        assert response.status_code == 202
+        mock_celery_tasks.assert_not_called()
+        mock_celery_tasks.delay.assert_called_once()
 
 
 class TestSDKTokenBlockedElsewhere:
