@@ -122,7 +122,10 @@ class TestSDKSyncInlineImport:
     def test_a_small_batch_imports_without_the_queue(
         self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
     ) -> None:
-        with patch("app.api.routes.v1.sdk_sync.store_raw_payload"):
+        with (
+            patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
+            patch("app.api.routes.v1.sdk_sync.trigger_sdk_drain") as trigger,
+        ):
             response = self._post(client, api_v1_prefix, _resting_hr_records(3))
 
         assert response.status_code == 202
@@ -130,24 +133,30 @@ class TestSDKSyncInlineImport:
         mock_celery_tasks.assert_called_once()
         assert mock_celery_tasks.call_args.kwargs["provider"] == "apple"
         mock_celery_tasks.delay.assert_not_called()
+        trigger.assert_not_called()
 
     def test_a_failed_inline_import_is_queued_instead(
         self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
     ) -> None:
         mock_celery_tasks.side_effect = RuntimeError("db down")
-        with patch("app.api.routes.v1.sdk_sync.store_raw_payload"):
+        with (
+            patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
+            patch("app.api.routes.v1.sdk_sync.trigger_sdk_drain") as trigger,
+        ):
             response = self._post(client, api_v1_prefix, _resting_hr_records(3))
 
         assert response.status_code == 202
         assert response.json()["response"] == "Import task queued successfully"
         mock_celery_tasks.delay.assert_called_once()
         assert mock_celery_tasks.delay.call_args.kwargs == mock_celery_tasks.call_args.kwargs
+        trigger.assert_called_once()
 
     def test_a_batch_over_the_limit_is_queued(
         self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
     ) -> None:
         with (
             patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
+            patch("app.api.routes.v1.sdk_sync.trigger_sdk_drain") as trigger,
             patch("app.api.routes.v1.sdk_sync.settings.sdk_inline_max_items", 2),
         ):
             response = self._post(client, api_v1_prefix, _resting_hr_records(3))
@@ -155,15 +164,35 @@ class TestSDKSyncInlineImport:
         assert response.status_code == 202
         mock_celery_tasks.assert_not_called()
         mock_celery_tasks.delay.assert_called_once()
+        trigger.assert_called_once()
 
     def test_an_empty_batch_is_queued(
         self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
     ) -> None:
-        with patch("app.api.routes.v1.sdk_sync.store_raw_payload"):
+        with (
+            patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
+            patch("app.api.routes.v1.sdk_sync.trigger_sdk_drain") as trigger,
+        ):
             response = self._post(client, api_v1_prefix, [])
 
         assert response.status_code == 202
         mock_celery_tasks.assert_not_called()
+        mock_celery_tasks.delay.assert_called_once()
+        trigger.assert_called_once()
+
+    def test_a_failed_drain_trigger_still_returns_202(
+        self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
+    ) -> None:
+        with (
+            patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
+            patch(
+                "app.api.routes.v1.sdk_sync.trigger_sdk_drain",
+                side_effect=RuntimeError("down"),
+            ),
+        ):
+            response = self._post(client, api_v1_prefix, [])
+
+        assert response.status_code == 202
         mock_celery_tasks.delay.assert_called_once()
 
 

@@ -8,6 +8,7 @@ from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_up
 from app.schemas.providers.mobile_sdk import SyncRequest
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.raw_payload_storage import store_raw_payload
+from app.services.sdk_drain_trigger import trigger_sdk_drain
 from app.utils.auth import SDKAuthDep
 from app.utils.structured_logging import log_structured
 
@@ -127,5 +128,11 @@ def sync_sdk_data(
             )
 
     process_sdk_upload.delay(**task_kwargs)
+
+    # Fire-and-forget. A failed start still returns 202; the hourly job is the backstop.
+    try:
+        trigger_sdk_drain()
+    except Exception:
+        logger.warning("event=sdk_drain_trigger_failed")
 
     return UploadDataResponse(status_code=202, response="Import task queued successfully", user_id=user_id)

@@ -4,6 +4,7 @@ Integration tests for Apple SDK (HealthKit) data import.
 Tests the full import flow for Apple HealthKit data via SDK.
 """
 
+import json
 import logging
 from decimal import Decimal
 from typing import Any
@@ -13,7 +14,8 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.orm import Session
 
-from app.models import EventRecord, WorkoutDetails
+from app.models import DataPointSeries, DataSource, EventRecord, WorkoutDetails
+from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.enums import SeriesType
 from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
 from app.services.apple.healthkit.import_service import ImportService
@@ -703,3 +705,194 @@ class TestSDKImportUnitConversion:
         assert len(samples) == 1
         assert samples[0].series_type == SeriesType.blood_glucose
         assert samples[0].value == Decimal("105")
+
+    def test_daily_total_flag_is_passed_through(self, import_service: ImportService) -> None:
+        user_id = str(uuid4())
+        record = self._record("HKQuantityTypeIdentifierStepCount", 8000, unit="count")
+        record["isDailyTotal"] = True
+        samples = import_service._build_statistic_bundles(
+            self._build_request("apple", [record]),
+            user_id,
+        )
+        assert len(samples) == 1
+        assert samples[0].is_daily_total is True
+
+    def test_step_samples_stay_intraday_without_the_flag(self, import_service: ImportService) -> None:
+        user_id = str(uuid4())
+        record = self._record("HKQuantityTypeIdentifierStepCount", 40, unit="count")
+        samples = import_service._build_statistic_bundles(
+            self._build_request("apple", [record]),
+            user_id,
+        )
+        assert samples[0].is_daily_total is False
+
+
+class TestSDKImportReportsHonestCounts:
+    """W3: `records_saved` must be rows written, not samples submitted.
+
+    It previously reported ``len(samples)``, so a batch that persisted nothing
+    still returned 200 / "Import successful". That false signal is what hid W2
+    (the device's 6-month history was accepted and never stored).
+    """
+
+    @pytest.fixture
+    def import_service(self) -> ImportService:
+        return ImportService(log=logging.getLogger("test"))
+
+    @staticmethod
+    def _records_only_payload(record_id: str = "11110000-2222-3333-4444-555566667777") -> dict[str, Any]:
+        return {
+            **SDK_ENVELOPE,
+            "data": {
+                "records": [
+                    {
+                        "id": record_id,
+                        "type": "HKQuantityTypeIdentifierStepCount",
+                        "unit": "count",
+                        "value": 123,
+                        "startDate": "2025-03-01T10:00:00Z",
+                        "endDate": "2025-03-01T10:05:00Z",
+                        "source": {
+                            "name": "iPhone",
+                            "bundleIdentifier": "com.apple.health",
+                            "deviceManufacturer": "Apple Inc.",
+                            "deviceModel": "iPhone",
+                            "productType": "iPhone17,3",
+                            "deviceSoftwareVersion": "18.0",
+                            "operatingSystemVersion": {
+                                "majorVersion": 18,
+                                "minorVersion": 0,
+                                "patchVersion": 0,
+                            },
+                        },
+                    }
+                ],
+            },
+        }
+
+    def test_records_saved_counts_rows_written(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        """A first import reports the row as both written and newly inserted."""
+        user = UserFactory()
+
+        result = import_service.load_data(db, self._records_only_payload(), str(user.id))
+
+        assert result["records_saved"] == 1
+        assert result["records_inserted"] == 1
+
+    def test_reimport_is_not_reported_as_new_data(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        """Re-uploading known samples upserts in place: written, but not inserted."""
+        user = UserFactory()
+        payload = self._records_only_payload()
+
+        first = import_service.load_data(db, payload, str(user.id))
+        assert first["records_inserted"] == 1
+
+        second = import_service.load_data(db, payload, str(user.id))
+
+        assert second["records_inserted"] == 0
+        assert second["records_saved"] == 1
+
+    def test_daily_total_resend_overwrites_the_same_row(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        user = UserFactory()
+        payload = self._records_only_payload()
+        record = payload["data"]["records"][0]
+        record["isDailyTotal"] = True
+        record["value"] = 8000
+        record["startDate"] = "2026-06-15T12:00:00Z"
+        record["endDate"] = "2026-06-15T12:00:00Z"
+        record["source"]["name"] = "PreventCare"
+
+        import_service.load_data(db, payload, str(user.id))
+        record["value"] = 8100
+        second = import_service.load_data(db, payload, str(user.id))
+
+        assert second["records_inserted"] == 0
+        rows = (
+            db.query(DataPointSeries)
+            .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user.id)
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].is_daily_total is True
+        assert int(rows[0].value) == 8100
+
+    def test_empty_payload_reports_zero_inserted(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        user = UserFactory()
+        payload: dict[str, Any] = {**SDK_ENVELOPE, "data": {}}
+
+        result = import_service.load_data(db, payload, str(user.id))
+
+        assert result["records_saved"] == 0
+        assert result["records_inserted"] == 0
+
+    def test_persisting_nothing_does_not_claim_success(
+        self,
+        db: Session,
+        import_service: ImportService,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Incoming data that stores no rows must warn and must not say 'successful'."""
+        user = UserFactory()
+        payload = self._records_only_payload()
+
+        with patch.object(
+            import_service.timeseries_service,
+            "bulk_create_samples",
+            return_value=WriteCounts(0, 0),
+        ):
+            response = import_service.import_data_from_request(
+                db,
+                json.dumps(payload),
+                "application/json",
+                str(user.id),
+                batch_id="batch-w3",
+            )
+
+        assert response.response == "Import accepted, no rows persisted"
+        assert "Import successful" not in response.response
+
+        emitted = capsys.readouterr().out
+        assert "apple_sdk_import_no_rows" in emitted
+        warning = next(
+            json.loads(line)
+            for line in emitted.splitlines()
+            if line.startswith("{") and "apple_sdk_import_no_rows" in line
+        )
+        assert warning["level"] == "warning"
+        assert warning["incoming_records"] == 1
+
+    def test_successful_import_still_reports_success(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        """The honest-message branch must not fire when rows really land."""
+        user = UserFactory()
+
+        response = import_service.import_data_from_request(
+            db,
+            json.dumps(self._records_only_payload()),
+            "application/json",
+            str(user.id),
+            batch_id="batch-w3-ok",
+        )
+
+        assert response.status_code == 200
+        assert response.response == "Import successful"

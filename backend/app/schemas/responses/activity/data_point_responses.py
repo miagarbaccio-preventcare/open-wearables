@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -60,6 +60,7 @@ class ActivityAggregateResult(TypedDict):
     distance_sum: float | None
     flights_climbed_sum: int | None
     active_time_minutes: int | None  # Provider-reported daily active time; None when not reported
+    steps_from_daily_total: NotRequired[bool]
 
 
 class ActiveMinutesResult(TypedDict):

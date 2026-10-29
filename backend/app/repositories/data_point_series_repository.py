@@ -769,6 +769,12 @@ class DataPointSeriesRepository(
                 prefer_daily_sum(flights_id).label("flights_climbed_sum"),
                 # Provider-reported active time (minutes) - daily total (NULL when no data)
                 prefer_daily_sum(active_time_id).label("active_time_sum"),
+                func.bool_or(
+                    and_(
+                        self.model.series_type_definition_id == steps_id,
+                        self.model.is_daily_total.is_(True),
+                    )
+                ).label("steps_from_daily_total"),
             )
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
@@ -810,6 +816,7 @@ class DataPointSeriesRepository(
                     if row.flights_climbed_sum is not None
                     else None,
                     "active_time_minutes": int(row.active_time_sum) if row.active_time_sum is not None else None,
+                    "steps_from_daily_total": bool(row.steps_from_daily_total),
                 }
             )
         return aggregates

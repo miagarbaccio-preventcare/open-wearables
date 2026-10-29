@@ -902,3 +902,6 @@ class TestDataPointSeriesRepository:
         by_source = {r["source"]: r["steps_sum"] for r in result}
         assert by_source["garmin"] == 10000
         assert by_source["apple"] == 8000
+        flagged = {r["source"]: r["steps_from_daily_total"] for r in result}
+        assert flagged["garmin"] is True
+        assert flagged["apple"] is False

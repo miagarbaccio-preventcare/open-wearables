@@ -171,7 +171,7 @@ class ImportService:
                 zone_offset=rjson.zoneOffset,
                 value=value,
                 series_type=series_type,
-                is_daily_total=daily_total_flag(series_type, is_daily=False),
+                is_daily_total=daily_total_flag(series_type, is_daily=bool(rjson.isDailyTotal)),
             )
 
             match series_type:
@@ -271,11 +271,20 @@ class ImportService:
         Load data into database and return counts of saved items.
 
         Returns:
-            dict with counts: {"workouts_saved": int, "records_saved": int, "sleep_saved": int}
+            dict with counts: {"workouts_saved": int, "records_saved": int,
+            "records_inserted": int, "sleep_saved": int}
+
+        ``records_saved`` is rows actually written (inserted + updated in place),
+        not samples submitted. ``records_inserted`` counts only rows that did not
+        already exist, so a pure re-upload of known data cannot look like newly
+        arrived data. ``sleep_saved`` counts segments accepted into session state:
+        sleep persistence is deferred until a session is finalized, so a batch can
+        legitimately persist no sleep rows while still making progress.
         """
         request = SDKSyncRequest(**raw)
         workouts_saved = 0
         records_saved = 0
+        records_inserted = 0
         sleep_saved = 0
 
         # Process workouts in batch
@@ -300,14 +309,16 @@ class ImportService:
 
             # Bulk create time series samples
             if time_series_samples:
-                self.timeseries_service.bulk_create_samples(db_session, time_series_samples)
-                records_saved += len(time_series_samples)
+                counts = self.timeseries_service.bulk_create_samples(db_session, time_series_samples)
+                records_saved += counts
+                records_inserted += counts.inserted
 
         # Process time series samples (records)
         samples = self._build_statistic_bundles(request, user_id)
         if samples:
-            self.timeseries_service.bulk_create_samples(db_session, samples)
-            records_saved += len(samples)
+            counts = self.timeseries_service.bulk_create_samples(db_session, samples)
+            records_saved += counts
+            records_inserted += counts.inserted
 
         # Commit all workout and timeseries changes in one transaction
         db_session.commit()
@@ -320,6 +331,7 @@ class ImportService:
         return {
             "workouts_saved": workouts_saved,
             "records_saved": records_saved,
+            "records_inserted": records_inserted,
             "sleep_saved": sleep_saved,
         }
 
@@ -370,6 +382,24 @@ class ImportService:
             if connection and items_saved > 0:
                 self.user_connection_repo.update_last_synced_at(db_session, connection)
 
+            # A batch that arrives with data but persists none is the signal that
+            # hid W2 for months: records_saved used to report samples submitted,
+            # so a total write failure still logged "Import successful".
+            incoming_total = incoming_records + incoming_workouts + incoming_sleep
+            if incoming_total > 0 and items_saved == 0:
+                log_structured(
+                    self.log,
+                    "warning",
+                    f"{provider.capitalize()} import persisted nothing",
+                    provider=f"{provider}",
+                    action=f"{provider}_sdk_import_no_rows",
+                    batch_id=batch_id,
+                    user_id=user_id,
+                    incoming_records=incoming_records,
+                    incoming_workouts=incoming_workouts,
+                    incoming_sleep=incoming_sleep,
+                )
+
             # Log detailed processing results
             log_structured(
                 self.log,
@@ -383,6 +413,7 @@ class ImportService:
                 incoming_workouts=incoming_workouts,
                 incoming_sleep=incoming_sleep,
                 records_saved=saved_counts["records_saved"],
+                records_inserted=saved_counts["records_inserted"],
                 workouts_saved=saved_counts["workouts_saved"],
                 sleep_saved=saved_counts["sleep_saved"],
             )
@@ -404,6 +435,14 @@ class ImportService:
                 user_id=user_id,
             )
 
+        # Status stays 200 so the SDK does not retry-storm a batch we accepted and
+        # parsed, but the message no longer claims success when nothing persisted.
+        if incoming_total > 0 and items_saved == 0:
+            return UploadDataResponse(
+                status_code=200,
+                response="Import accepted, no rows persisted",
+                user_id=user_id,
+            )
         return UploadDataResponse(status_code=200, response="Import successful", user_id=user_id)
 
     def _parse_multipart_content(self, content: str) -> dict | None:

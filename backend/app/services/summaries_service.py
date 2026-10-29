@@ -133,7 +133,10 @@ class SummariesService:
                 continue
 
             # Sort by priority
-            def sort_key(entry: dict) -> tuple[int, int, str]:
+            def sort_key(entry: dict) -> tuple[int, int, int, str]:
+                # A phone-published daily step total beats a sum of raw samples
+                # from another device on the same day (ADR 0009).
+                daily_rank = 0 if entry.get("steps_from_daily_total") else 1
                 raw_provider = entry.get("provider") or entry.get("source")
                 try:
                     provider = ProviderName(raw_provider)
@@ -149,7 +152,7 @@ class SummariesService:
                     device_type = infer_device_type_from_model(device_model)
                     device_type_priority = device_type_order.get(device_type, 99)
 
-                return (provider_priority, device_type_priority, device_model or "")
+                return (daily_rank, provider_priority, device_type_priority, device_model or "")
 
             entries_sorted = sorted(entries, key=sort_key)
             filtered.append(entries_sorted[0])

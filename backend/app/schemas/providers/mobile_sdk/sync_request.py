@@ -79,6 +79,7 @@ class MetricRecord(BaseModel):
     source: SourceInfo | None = None
     value: Decimal
     unit: str | None
+    isDailyTotal: bool = False
     metadata: list[dict[str, Any]] | dict[str, Any] | None = None
 
 

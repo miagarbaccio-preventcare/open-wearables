@@ -64,6 +64,28 @@ class TestFilterByPriority:
         result = service._filter_by_priority(db, uuid4(), entries, date_key="sleep_date")
         assert len(result) == 1
 
+    def test_daily_step_total_beats_another_device(self, db: Session, service: SummariesService) -> None:
+        day = date(2026, 6, 20)
+        watch = {
+            "activity_date": day,
+            "provider": "apple",
+            "source": "Apple Watch",
+            "device_model": "Apple Watch",
+            "steps_sum": 14000,
+            "steps_from_daily_total": False,
+        }
+        phone = {
+            "activity_date": day,
+            "provider": "apple",
+            "source": "PreventCare",
+            "device_model": None,
+            "steps_sum": 8000,
+            "steps_from_daily_total": True,
+        }
+        result = service._filter_by_priority(db, uuid4(), [watch, phone])
+        assert len(result) == 1
+        assert result[0]["steps_sum"] == 8000
+
 
 # ---------------------------------------------------------------------------
 # _get_user_max_hr
