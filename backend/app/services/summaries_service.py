@@ -666,6 +666,9 @@ class SummariesService:
                 sedentary_minutes=sedentary_mins,
                 intensity_minutes=intensity_mins,
                 heart_rate=hr_stats,
+                resting_heart_rate_bpm=result.get("resting_heart_rate_avg"),
+                avg_hrv_sdnn_ms=result.get("hrv_sdnn_avg"),
+                avg_spo2_percent=result.get("spo2_avg"),
             )
             data.append(summary)
 

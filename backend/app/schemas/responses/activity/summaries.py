@@ -38,6 +38,13 @@ class ActivitySummary(BaseModel):
     intensity_minutes: IntensityMinutes | None = None
     # Heart rate aggregates
     heart_rate: HeartRateStats | None = None
+    # Calendar-day means of the stored samples. prevent-api copies these onto
+    # the daily health document. A missing series stays null.
+    resting_heart_rate_bpm: int | None = Field(None, description="Mean resting heart rate for the local day")
+    avg_hrv_sdnn_ms: float | None = Field(None, description="Mean heart-rate variability (SDNN) for the local day")
+    avg_spo2_percent: float | None = Field(
+        None, description="Mean blood oxygen for the local day, fraction or percent as stored"
+    )
 
 
 class SleepStagesSummary(BaseModel):
