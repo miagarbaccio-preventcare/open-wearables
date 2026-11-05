@@ -51,7 +51,7 @@ class ActivityAggregateResult(TypedDict):
     provider: str | None
     source: str | None
     device_model: str | None
-    steps_sum: int
+    steps_sum: int | None
     active_energy_sum: float
     basal_energy_sum: float
     hr_avg: int | None
@@ -61,6 +61,10 @@ class ActivityAggregateResult(TypedDict):
     flights_climbed_sum: int | None
     active_time_minutes: int | None  # Provider-reported daily active time; None when not reported
     steps_from_daily_total: NotRequired[bool]
+    # Calendar-day means. Absent on archive rows that predate these columns.
+    resting_heart_rate_avg: NotRequired[int | None]
+    hrv_sdnn_avg: NotRequired[float | None]
+    spo2_avg: NotRequired[float | None]
 
 
 class ActiveMinutesResult(TypedDict):
