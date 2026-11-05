@@ -159,6 +159,70 @@ class SummariesService:
 
         return filtered
 
+    _ACTIVITY_VITAL_FIELDS = (
+        "resting_heart_rate_avg",
+        "hrv_sdnn_avg",
+        "spo2_avg",
+    )
+
+    def _source_rank(
+        self,
+        entry: dict,
+        provider_order: dict,
+        device_type_order: dict,
+    ) -> tuple[int, int, str]:
+        """Provider and device order, without the daily-step rank."""
+        raw_provider = entry.get("provider") or entry.get("source")
+        try:
+            provider = ProviderName(raw_provider)
+        except ValueError:
+            provider = ProviderName.UNKNOWN
+        provider_priority = provider_order.get(provider, 99)
+        device_model = entry.get("device_model")
+        device_type_priority = 99
+        if device_model:
+            device_type = infer_device_type_from_model(device_model)
+            device_type_priority = device_type_order.get(device_type, 99)
+        return (provider_priority, device_type_priority, device_model or "")
+
+    def _copy_vitals_onto_activity_winner(
+        self,
+        db_session: DbSession,
+        winners: list[dict] | list,
+        all_rows: list[dict] | list,
+    ) -> list[dict] | list:
+        """Copy null calendar-day vitals onto the activity row the filter kept.
+
+        A phone step total wins the row and has no resting heart rate, HRV, or
+        blood oxygen. Those averages stay on the other source for that day.
+        The winner's steps, and any vital it already has, stay put. A day with
+        no sample for a field stays null.
+        """
+        if not winners or not all_rows:
+            return winners
+
+        provider_order = ProviderPriorityRepository(ProviderPriority).get_priority_order(db_session)
+        device_type_order = DeviceTypePriorityRepository().get_priority_order(db_session)
+
+        by_date: dict = defaultdict(list)
+        for row in all_rows:
+            by_date[row.get("activity_date")].append(row)
+
+        for winner in winners:
+            donors = sorted(
+                (row for row in by_date.get(winner.get("activity_date"), []) if row is not winner),
+                key=lambda row: self._source_rank(row, provider_order, device_type_order),
+            )
+            for field in self._ACTIVITY_VITAL_FIELDS:
+                if winner.get(field) is not None:
+                    continue
+                for donor in donors:
+                    value = donor.get(field)
+                    if value is not None:
+                        winner[field] = value
+                        break
+        return winners
+
     def _get_user_max_hr(self, db_session: DbSession, user_id: UUID, reference_date: datetime) -> int:
         """Calculate user's max HR based on age.
 
@@ -473,8 +537,11 @@ class SummariesService:
         # Merge archived data when archival is enabled
         results = self._merge_archive_activity(db_session, user_id, start_date, end_date, results)
 
-        # Filter by priority to get best source per date
-        results = self._filter_by_priority(db_session, user_id, results, date_key="activity_date")
+        # Filter by priority to get best source per date, then fill the three
+        # calendar-day vitals the step-total row does not carry.
+        aggregated = results
+        results = self._filter_by_priority(db_session, user_id, aggregated, date_key="activity_date")
+        results = self._copy_vitals_onto_activity_winner(db_session, results, aggregated)
 
         # Get workout aggregates (elevation, distance, energy from workouts)
         workout_aggregates = self.event_record_repo.get_daily_workout_aggregates(

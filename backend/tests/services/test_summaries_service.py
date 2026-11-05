@@ -87,6 +87,99 @@ class TestFilterByPriority:
         assert result[0]["steps_sum"] == 8000
 
 
+def _phone_steps(day: date, steps: int = 8000) -> dict[str, Any]:
+    return {
+        "activity_date": day,
+        "provider": "apple",
+        "source": "PreventCare",
+        "device_model": None,
+        "steps_sum": steps,
+        "steps_from_daily_total": True,
+        "resting_heart_rate_avg": None,
+        "hrv_sdnn_avg": None,
+        "spo2_avg": None,
+    }
+
+
+def _watch_row(
+    day: date,
+    *,
+    device_model: str = "Watch7,1",
+    steps: int = 14000,
+    resting: float | None = 55,
+    hrv: float | None = 45,
+    spo2: float | None = 97,
+) -> dict[str, Any]:
+    return {
+        "activity_date": day,
+        "provider": "apple",
+        "source": "Apple Watch",
+        "device_model": device_model,
+        "steps_sum": steps,
+        "steps_from_daily_total": False,
+        "resting_heart_rate_avg": resting,
+        "hrv_sdnn_avg": hrv,
+        "spo2_avg": spo2,
+    }
+
+
+class TestCopyVitalsOntoActivityWinner:
+    """Year-end and the US spring-forward day. The filter still keeps the phone steps."""
+
+    boundary_days = (date(2025, 12, 31), date(2026, 3, 8))
+
+    def test_step_row_keeps_steps_and_gains_the_three_averages(self, db: Session, service: SummariesService) -> None:
+        for day in self.boundary_days:
+            phone = _phone_steps(day)
+            watch = _watch_row(day)
+            rows = [watch, phone]
+            winners = service._filter_by_priority(db, uuid4(), rows)
+            filled = service._copy_vitals_onto_activity_winner(db, winners, rows)
+            assert len(filled) == 1
+            assert filled[0]["steps_sum"] == 8000
+            assert filled[0]["steps_from_daily_total"] is True
+            assert filled[0]["resting_heart_rate_avg"] == 55
+            assert filled[0]["hrv_sdnn_avg"] == 45
+            assert filled[0]["spo2_avg"] == 97
+            assert watch["steps_sum"] == 14000
+
+    def test_step_only_day_leaves_the_three_fields_null(self, db: Session, service: SummariesService) -> None:
+        for day in self.boundary_days:
+            phone = _phone_steps(day)
+            winners = service._filter_by_priority(db, uuid4(), [phone])
+            filled = service._copy_vitals_onto_activity_winner(db, winners, [phone])
+            assert filled[0]["steps_sum"] == 8000
+            assert filled[0]["resting_heart_rate_avg"] is None
+            assert filled[0]["hrv_sdnn_avg"] is None
+            assert filled[0]["spo2_avg"] is None
+
+    def test_winner_value_is_not_replaced(self, db: Session, service: SummariesService) -> None:
+        for day in self.boundary_days:
+            phone = _phone_steps(day)
+            phone["resting_heart_rate_avg"] = 50
+            watch = _watch_row(day, resting=55, hrv=45, spo2=97)
+            rows = [watch, phone]
+            winners = service._filter_by_priority(db, uuid4(), rows)
+            filled = service._copy_vitals_onto_activity_winner(db, winners, rows)
+            assert filled[0]["steps_sum"] == 8000
+            assert filled[0]["resting_heart_rate_avg"] == 50
+            assert filled[0]["hrv_sdnn_avg"] == 45
+            assert filled[0]["spo2_avg"] == 97
+
+    def test_several_donors_follow_device_order_not_the_step_rank(self, db: Session, service: SummariesService) -> None:
+        for day in self.boundary_days:
+            phone = _phone_steps(day)
+            iphone = _watch_row(day, device_model="iPhone16,1", resting=70, hrv=20, spo2=90)
+            watch = _watch_row(day, device_model="Watch7,1", resting=55, hrv=45, spo2=97)
+            rows = [iphone, phone, watch]
+            winners = service._filter_by_priority(db, uuid4(), rows)
+            filled = service._copy_vitals_onto_activity_winner(db, winners, rows)
+            assert filled[0]["steps_sum"] == 8000
+            assert filled[0]["resting_heart_rate_avg"] == 55
+            assert filled[0]["hrv_sdnn_avg"] == 45
+            assert filled[0]["spo2_avg"] == 97
+
+
 # ---------------------------------------------------------------------------
 # _get_user_max_hr
 # ---------------------------------------------------------------------------
