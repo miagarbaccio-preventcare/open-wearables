@@ -73,7 +73,7 @@ def is_stuck(user_id: str, threshold_seconds: int = GC_STUCK_THRESHOLD_SECONDS) 
     anchor_val = get_redis_client().get(_key(user_id, "window", "anchor_ts"))
     if anchor_val:
         try:
-            anchor_ts = datetime.fromisoformat(anchor_val)  # ty:ignore[invalid-argument-type]
+            anchor_ts = datetime.fromisoformat(anchor_val)
             if most_recent is None or anchor_ts > most_recent:
                 most_recent = anchor_ts
         except (ValueError, TypeError):

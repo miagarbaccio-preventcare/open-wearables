@@ -124,7 +124,7 @@ def check_triggered_timeout(user_id: str, data_type: str) -> dict[str, Any]:
 
     triggered_at_str = get_redis_client().get(_get_key(user_id_str, "types", data_type, "triggered_at"))
     if triggered_at_str:
-        triggered_at = datetime.fromisoformat(triggered_at_str)  # ty:ignore[invalid-argument-type]
+        triggered_at = datetime.fromisoformat(triggered_at_str)
         elapsed = (datetime.now(timezone.utc) - triggered_at).total_seconds()
         if elapsed < TRIGGERED_TIMEOUT_SECONDS:
             remaining = int(TRIGGERED_TIMEOUT_SECONDS - elapsed) + 1
