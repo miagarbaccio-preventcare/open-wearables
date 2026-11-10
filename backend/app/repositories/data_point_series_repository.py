@@ -779,12 +779,12 @@ class DataPointSeriesRepository(
                 func.avg(
                     case((self.model.series_type_definition_id == resting_id, self.model.value), else_=None)
                 ).label("resting_hr_avg"),
-                func.avg(
-                    case((self.model.series_type_definition_id == hrv_id, self.model.value), else_=None)
-                ).label("hrv_sdnn_avg"),
-                func.avg(
-                    case((self.model.series_type_definition_id == spo2_id, self.model.value), else_=None)
-                ).label("spo2_avg"),
+                func.avg(case((self.model.series_type_definition_id == hrv_id, self.model.value), else_=None)).label(
+                    "hrv_sdnn_avg"
+                ),
+                func.avg(case((self.model.series_type_definition_id == spo2_id, self.model.value), else_=None)).label(
+                    "spo2_avg"
+                ),
                 func.bool_or(
                     and_(
                         self.model.series_type_definition_id == steps_id,

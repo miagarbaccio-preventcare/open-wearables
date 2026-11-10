@@ -112,19 +112,22 @@ def _create_new_sleep_state(
 
 
 def _apply_transition(
-    db_session: DbSession,
-    user_id: str,
     state: SleepState,
     sleep_phase: SleepPhase,
     start_time: datetime,
     end_time: datetime,
     provider: str,
+    closed: list[SleepState],
     uuid: str | None = None,
     source_name: str | None = None,
     device_model: str | None = None,
     zone_offset: str | None = None,
 ) -> SleepState:
-    """Apply a transition to the sleep state."""
+    """Apply a transition to the sleep state.
+
+    A gap longer than the night threshold closes the current night in memory.
+    The caller writes every closed night in one commit.
+    """
 
     # Compute the gap using session boundaries (start_time / end_time) rather than
     # the timestamps of the last-processed sample.  This correctly handles payloads
@@ -142,7 +145,7 @@ def _apply_transition(
         delta_seconds = (start_time - state.end_time).total_seconds()
 
     if delta_seconds > settings.sleep_end_gap_minutes * 60:
-        finish_sleep(db_session, user_id, state)
+        closed.append(state)
         state = _create_new_sleep_state(start_time, end_time, uuid, provider, source_name, device_model, zone_offset)
 
     if zone_offset and not state.zone_offset:
@@ -224,9 +227,10 @@ def handle_sleep_data(
         - Deduplicate incoming data based on start/end/stage/source
         - If no active session exists: Create new session in Redis (only for valid start states)
         - If active session exists: Check gap between new sample and the session window
-          * Gap > 2 hours: Finalize existing session, start new one
+          * Gap > 2 hours: Close the night in memory and start a new one
           * Otherwise: Accumulate sleep stage durations in existing session
-        - Persist state once after the whole batch; dispatch the stale-sleep task
+        - Write every closed night in one commit
+        - Persist the in-progress night to Redis once; dispatch the stale-sleep task
     """
     redis_client = get_redis_client()
     lock = redis_client.lock(f"sleep:lock:{user_id}", timeout=30, blocking_timeout=15)
@@ -239,6 +243,7 @@ def handle_sleep_data(
 
         current_state = load_sleep_state(user_id)
         provider = request.provider
+        closed: list[SleepState] = []
 
         # Deduplicate and sort
         seen = set()
@@ -281,34 +286,34 @@ def handle_sleep_data(
                 )
 
             current_state = _apply_transition(
-                db_session,
-                user_id,
                 current_state,
                 sleep_phase,
                 sjson.startDate,
                 sjson.endDate,
                 provider,
+                closed,
                 sjson.id,
                 original_source_name,
                 device_model,
                 sjson.zoneOffset,
             )
 
-        # Persist the accumulated state to Redis only once after processing the entire batch
+        # The in-progress night is the only Redis write. A night that already
+        # ended joins the batch and is removed after that batch commits.
+        trailing_is_closed = False
         if current_state:
             save_sleep_state(user_id, current_state)
-
-        # Finalise synchronously if the session is already stale.  Historical
-        # uploads have end_time far in the past so this fires immediately, but
-        # finish_sleep now merges the result with any adjacent record already in
-        # the DB — so each payload extends the growing record rather than
-        # creating a separate session.
-        if current_state:
             session_end = current_state.end_time
             if session_end.tzinfo is None:
                 session_end = session_end.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) - session_end >= timedelta(minutes=settings.sleep_end_gap_minutes):
-                finish_sleep(db_session, user_id, current_state)
+                closed.append(current_state)
+                trailing_is_closed = True
+
+        if closed:
+            _persist_closed_nights(db_session, user_id, closed)
+            if trailing_is_closed:
+                delete_sleep_state(user_id)
 
     finally:
         with contextlib.suppress(Exception):
@@ -422,6 +427,157 @@ def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[
     return metrics, cleaned_stages
 
 
+def _source_filter(state: SleepState) -> str | None:
+    if not state.source_name or state.source_name == "unknown":
+        return None
+    return state.source_name
+
+
+def _session_bounds(state: SleepState) -> tuple[datetime, datetime, dict, list[SleepStage]]:
+    metrics, cleaned_stages = _calculate_final_metrics(state.stages)
+    if cleaned_stages:
+        return cleaned_stages[0].start_time, cleaned_stages[-1].end_time, metrics, cleaned_stages
+    return state.start_time, state.end_time, metrics, cleaned_stages
+
+
+def _windows_are_adjacent(
+    start_a: datetime,
+    end_a: datetime,
+    start_b: datetime,
+    end_b: datetime,
+    threshold: timedelta,
+) -> bool:
+    return start_a <= end_b + threshold and end_a >= start_b - threshold
+
+
+def _build_sleep_record_and_detail(
+    user_id: str,
+    state: SleepState,
+    metrics: dict,
+    cleaned_stages: list[SleepStage],
+    start_time: datetime,
+    end_time: datetime,
+) -> tuple[EventRecordCreate, EventRecordDetailCreate]:
+    source_for_lookup = _source_filter(state)
+    total_duration = (end_time - start_time).total_seconds()
+    total_sleep_seconds = (
+        metrics["sleeping_seconds"] + metrics["light_seconds"] + metrics["deep_seconds"] + metrics["rem_seconds"]
+    )
+    time_in_bed_seconds = max(metrics["in_bed_seconds"], total_sleep_seconds + metrics["awake_seconds"])
+    sleep_efficiency = (
+        Decimal(str(total_sleep_seconds / time_in_bed_seconds * 100)) if time_in_bed_seconds > 0 else None
+    )
+    sleep_record = EventRecordCreate(
+        id=uuid4(),
+        external_id=state.uuid,
+        user_id=UUID(user_id),
+        start_datetime=start_time,
+        end_datetime=end_time,
+        zone_offset=state.zone_offset,
+        duration_seconds=int(total_duration),
+        category="sleep",
+        type="sleep_session",
+        source_name=state.source_name or "unknown",
+        source=source_for_lookup,
+        provider=state.provider,
+        device_model=state.device_model,
+    )
+    detail = EventRecordDetailCreate(
+        record_id=sleep_record.id,
+        sleep_total_duration_minutes=int(total_sleep_seconds // 60),
+        sleep_time_in_bed_minutes=int(time_in_bed_seconds // 60),
+        sleep_deep_minutes=int(metrics["deep_seconds"] // 60),
+        sleep_rem_minutes=int(metrics["rem_seconds"] // 60),
+        sleep_light_minutes=int(metrics["light_seconds"] // 60),
+        sleep_awake_minutes=int(metrics["awake_seconds"] // 60),
+        sleep_efficiency_score=sleep_efficiency,
+        is_nap=False,
+        sleep_stages=cleaned_stages or None,
+    )
+    return sleep_record, detail
+
+
+def _stored_stages(record: object) -> list[SleepStateStage]:
+    detail = getattr(record, "detail", None)
+    raw_stages = getattr(detail, "sleep_stages", None) if detail is not None else None
+    if not raw_stages:
+        return []
+    stages: list[SleepStateStage] = []
+    for stage in raw_stages:
+        with contextlib.suppress(Exception):
+            stages.append(SleepStateStage.model_validate(stage))
+    return stages
+
+
+def _persist_closed_nights(
+    db_session: DbSession,
+    user_id: str,
+    nights: list[SleepState],
+) -> None:
+    """Write every finished night in one commit, merging any stored neighbors."""
+    if not nights:
+        return
+
+    bounds = [_session_bounds(state) for state in nights]
+    window_start = min(item[0] for item in bounds)
+    window_end = max(item[1] for item in bounds)
+    providers = {state.provider for state in nights}
+    provider_filter = providers.pop() if len(providers) == 1 else None
+    source_filters = {_source_filter(state) for state in nights}
+    source_filter = source_filters.pop() if len(source_filters) == 1 else None
+    threshold = timedelta(minutes=settings.sleep_end_gap_minutes)
+
+    stored = event_record_service.find_sleep_records_in_window(
+        db_session,
+        UUID(user_id),
+        window_start,
+        window_end,
+        settings.sleep_end_gap_minutes,
+        source=source_filter,
+        provider=provider_filter,
+    )
+
+    used: set[UUID] = set()
+    to_delete: list[UUID] = []
+    records: list[EventRecordCreate] = []
+    details: list[EventRecordDetailCreate] = []
+
+    for state, (start_time, end_time, metrics, cleaned_stages) in zip(nights, bounds, strict=True):
+        neighbors = []
+        for record in stored:
+            if record.id in used:
+                continue
+            if not _windows_are_adjacent(record.start_datetime, record.end_datetime, start_time, end_time, threshold):
+                continue
+            neighbors.append(record)
+            used.add(record.id)
+
+        if neighbors:
+            combined = []
+            for record in neighbors:
+                combined.extend(_stored_stages(record))
+                to_delete.append(record.id)
+                start_time = min(start_time, record.start_datetime)
+                end_time = max(end_time, record.end_datetime)
+            metrics, cleaned_stages = _calculate_final_metrics(combined + state.stages)
+            if cleaned_stages:
+                start_time = min(start_time, cleaned_stages[0].start_time)
+                end_time = max(end_time, cleaned_stages[-1].end_time)
+
+        record, detail = _build_sleep_record_and_detail(user_id, state, metrics, cleaned_stages, start_time, end_time)
+        records.append(record)
+        details.append(detail)
+
+    if to_delete:
+        event_record_service.delete_by_ids(db_session, to_delete)
+
+    inserted_ids = set(event_record_service.bulk_create(db_session, records))
+    details_to_insert = [detail for detail in details if detail.record_id in inserted_ids]
+    if details_to_insert:
+        event_record_service.bulk_create_details(db_session, details_to_insert, detail_type="sleep")
+    db_session.commit()
+
+
 def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None:
     """Finish a sleep session and save the record to the database.
 
@@ -480,45 +636,7 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         # Remove the old record before creating the merged one (cascade deletes detail).
         event_record_service.delete(db_session, adjacent.id)
 
-    # ---
-
-    total_duration = (end_time - start_time).total_seconds()
-    total_sleep_seconds = (
-        metrics["sleeping_seconds"] + metrics["light_seconds"] + metrics["deep_seconds"] + metrics["rem_seconds"]
-    )
-    time_in_bed_seconds = max(metrics["in_bed_seconds"], total_sleep_seconds + metrics["awake_seconds"])
-    sleep_efficiency = (
-        Decimal(str(total_sleep_seconds / time_in_bed_seconds * 100)) if time_in_bed_seconds > 0 else None
-    )
-
-    sleep_record = EventRecordCreate(
-        id=uuid4(),
-        external_id=state.uuid,
-        user_id=UUID(user_id),
-        start_datetime=start_time,
-        end_datetime=end_time,
-        zone_offset=state.zone_offset,
-        duration_seconds=int(total_duration),
-        category="sleep",
-        type="sleep_session",
-        source_name=state.source_name or "unknown",
-        source=source_for_lookup,
-        provider=state.provider,
-        device_model=state.device_model,
-    )
-
-    detail = EventRecordDetailCreate(
-        record_id=sleep_record.id,
-        sleep_total_duration_minutes=int(total_sleep_seconds // 60),
-        sleep_time_in_bed_minutes=int(time_in_bed_seconds // 60),
-        sleep_deep_minutes=int(metrics["deep_seconds"] // 60),
-        sleep_rem_minutes=int(metrics["rem_seconds"] // 60),
-        sleep_light_minutes=int(metrics["light_seconds"] // 60),
-        sleep_awake_minutes=int(metrics["awake_seconds"] // 60),
-        sleep_efficiency_score=sleep_efficiency,
-        is_nap=False,
-        sleep_stages=cleaned_stages or None,
-    )
+    sleep_record, detail = _build_sleep_record_and_detail(user_id, state, metrics, cleaned_stages, start_time, end_time)
 
     try:
         created_or_existing_record = event_record_service.create(db_session, sleep_record)

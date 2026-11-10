@@ -37,6 +37,16 @@ def _dt(iso: str) -> datetime:
     return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
 
+def _stub_batch_write(mock_event_service: MagicMock, stored: list | None = None) -> None:
+    """The batch save reads stored nights, then inserts the finished ones."""
+    mock_event_service.find_sleep_records_in_window.return_value = stored or []
+
+    def _inserted(_db: Session, records: list[EventRecordCreate]) -> list:
+        return [record.id for record in records]
+
+    mock_event_service.bulk_create.side_effect = _inserted
+
+
 # ---------------------------------------------------------------------------
 # Synthetic payload: older Apple Watch (pre-watchOS 9) with sleeping + in_bed
 # Mimics pattern: Watch sends "sleeping" segments, iPhone sends "in_bed"
@@ -556,6 +566,7 @@ class TestHandleSleepDataIntegration:
         mock_record.id = uuid4()
         mock_event_service.create.return_value = mock_record
         mock_event_service.find_adjacent_sleep_record.return_value = None
+        _stub_batch_write(mock_event_service)
 
         request = SyncRequest.model_validate(OLD_WATCH_PAYLOAD)
 
@@ -606,6 +617,7 @@ class TestHandleSleepDataIntegration:
         mock_record.id = uuid4()
         mock_event_service.create.return_value = mock_record
         mock_event_service.find_adjacent_sleep_record.return_value = None
+        _stub_batch_write(mock_event_service)
 
         request = SyncRequest.model_validate(DETAILED_STAGES_PAYLOAD)
 
@@ -714,6 +726,7 @@ class TestNoIntermediateRedisSaves:
         mock_record.id = uuid4()
         mock_event_service.create.return_value = mock_record
         mock_event_service.find_adjacent_sleep_record.return_value = None
+        _stub_batch_write(mock_event_service)
 
         request = SyncRequest.model_validate(DETAILED_STAGES_PAYLOAD)
 
@@ -743,10 +756,8 @@ class TestHistoricalBulkUploadMerging:
     synchronous stale-check fires on every payload (now - end_time >> 2 h),
     immediately finalizing each payload as its own separate session.
 
-    The fix: finish_sleep() queries for an adjacent existing record and merges
-    instead of always inserting.  Combined with the per-user Redis lock that
-    serializes concurrent tasks, this guarantees one DB record per night
-    regardless of how many payloads Apple sends.
+    The batch save loads the stored night once, deletes it, and inserts the
+    merged night in the same commit. One night stays one row.
     """
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
@@ -810,33 +821,140 @@ class TestHistoricalBulkUploadMerging:
         mock_redis.get.return_value = None  # No active Redis state for this user
         mock_redis_func.return_value = mock_redis
 
-        mock_record = MagicMock()
-        mock_record.id = uuid4()
-        mock_event_service.create.return_value = mock_record
-        # First call to find_adjacent returns the payload-A record; second call (if any) returns None
-        mock_event_service.find_adjacent_sleep_record.return_value = mock_adjacent
+        _stub_batch_write(mock_event_service, stored=[mock_adjacent])
+        commits: list[int] = []
+        original_commit = db.commit
+
+        def _count_commit(*args: object, **kwargs: object) -> None:
+            commits.append(1)
+            original_commit(*args, **kwargs)
+
+        db.commit = _count_commit  # type: ignore[method-assign]
 
         handle_sleep_data(db, SyncRequest.model_validate(payload_b), user_id)
 
-        # find_adjacent_sleep_record must have been called to look for a matching record
-        mock_event_service.find_adjacent_sleep_record.assert_called_once()
-
-        # The old record must be deleted before the merged one is created
-        mock_event_service.delete.assert_called_once_with(db, mock_adjacent.id)
-
-        # A new (merged) record must be created
-        mock_event_service.create.assert_called_once()
-        created_record: EventRecordCreate = mock_event_service.create.call_args[0][1]
+        mock_event_service.find_sleep_records_in_window.assert_called_once()
+        mock_event_service.delete_by_ids.assert_called_once_with(db, [mock_adjacent.id])
+        mock_event_service.bulk_create.assert_called_once()
+        created_records: list[EventRecordCreate] = mock_event_service.bulk_create.call_args[0][1]
+        assert len(created_records) == 1
+        created_record = created_records[0]
 
         # Merged window covers both A and B
         assert created_record.start_datetime <= _dt("2026-03-22T23:00:00Z")
         assert created_record.end_datetime >= _dt("2026-03-23T06:00:00Z")
 
-        # Detail must contain stages from both payloads
-        mock_event_service.create_detail.assert_called_once()
-        created_detail: EventRecordDetailCreate = mock_event_service.create_detail.call_args[0][1]
-        assert created_detail.sleep_stages is not None
-        stage_types = {s.stage for s in created_detail.sleep_stages}
+        mock_event_service.bulk_create_details.assert_called_once()
+        created_details: list[EventRecordDetailCreate] = mock_event_service.bulk_create_details.call_args[0][1]
+        assert len(created_details) == 1
+        assert created_details[0].sleep_stages is not None
+        stage_types = {s.stage for s in created_details[0].sleep_stages}
         assert SleepStageType.LIGHT in stage_types
         assert SleepStageType.DEEP in stage_types
         assert SleepStageType.REM in stage_types
+        assert commits == [1]
+
+
+def _sleep_segment(sample_id: str, stage: str, start: str, end: str) -> dict:
+    return {
+        "id": sample_id,
+        "stage": stage,
+        "startDate": start,
+        "endDate": end,
+        "source": {"device_type": "watch", "device_model": "Watch7,1"},
+    }
+
+
+def _sleep_request(segments: list[dict]) -> SyncRequest:
+    return SyncRequest.model_validate(
+        {
+            "provider": "apple",
+            "sdkVersion": "1.0.0",
+            "syncTimestamp": "2026-01-03T18:00:00Z",
+            "data": {"records": [], "workouts": [], "sleep": segments},
+        }
+    )
+
+
+class TestBatchNightSave:
+    """A historical upload writes every finished night in one commit."""
+
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    def test_many_nights_are_one_write(
+        self,
+        mock_redis_func: MagicMock,
+        mock_event_service: MagicMock,
+        mock_finalize: MagicMock,
+        db: Session,
+    ) -> None:
+        """Two nights that cross the year boundary become two rows and one commit."""
+        user_id = str(uuid4())
+        mock_redis = MagicMock()
+        mock_redis.get.return_value = None
+        mock_redis_func.return_value = mock_redis
+        _stub_batch_write(mock_event_service)
+        commits: list[int] = []
+        original_commit = db.commit
+
+        def _count_commit(*args: object, **kwargs: object) -> None:
+            commits.append(1)
+            original_commit(*args, **kwargs)
+
+        db.commit = _count_commit  # type: ignore[method-assign]
+
+        request = _sleep_request(
+            [
+                _sleep_segment("n1-deep", "deep", "2025-12-31T23:00:00Z", "2026-01-01T01:00:00Z"),
+                _sleep_segment("n1-rem", "rem", "2026-01-01T01:00:00Z", "2026-01-01T03:00:00Z"),
+                _sleep_segment("n2-deep", "deep", "2026-01-02T23:00:00Z", "2026-01-03T01:00:00Z"),
+                _sleep_segment("n2-light", "light", "2026-01-03T01:00:00Z", "2026-01-03T04:00:00Z"),
+            ]
+        )
+
+        handle_sleep_data(db, request, user_id)
+
+        assert len(mock_redis.set.call_args_list) == 1
+        mock_event_service.bulk_create.assert_called_once()
+        records: list[EventRecordCreate] = mock_event_service.bulk_create.call_args[0][1]
+        assert len(records) == 2
+        assert records[0].end_datetime <= _dt("2026-01-01T03:00:00Z")
+        assert records[1].start_datetime >= _dt("2026-01-02T23:00:00Z")
+
+        details: list[EventRecordDetailCreate] = mock_event_service.bulk_create_details.call_args[0][1]
+        assert len(details) == 2
+        first_stages = {stage.stage for stage in details[0].sleep_stages or []}
+        second_stages = {stage.stage for stage in details[1].sleep_stages or []}
+        assert first_stages == {SleepStageType.DEEP, SleepStageType.REM}
+        assert second_stages == {SleepStageType.DEEP, SleepStageType.LIGHT}
+        assert commits == [1]
+        mock_finalize.delay.assert_called_once()
+
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    def test_in_progress_night_is_not_written(
+        self,
+        mock_redis_func: MagicMock,
+        mock_event_service: MagicMock,
+        mock_finalize: MagicMock,
+        db: Session,
+    ) -> None:
+        """A night that ended minutes ago stays in Redis and is not saved."""
+        user_id = str(uuid4())
+        mock_redis = MagicMock()
+        mock_redis.get.return_value = None
+        mock_redis_func.return_value = mock_redis
+        _stub_batch_write(mock_event_service)
+
+        with patch("app.services.apple.healthkit.sleep_service.datetime") as clock:
+            clock.now.return_value = _dt("2026-03-11T06:30:00Z")
+            handle_sleep_data(db, SyncRequest.model_validate(DETAILED_STAGES_PAYLOAD), user_id)
+
+        mock_event_service.bulk_create.assert_not_called()
+        mock_event_service.delete_by_ids.assert_not_called()
+        assert len(mock_redis.set.call_args_list) == 1
+        mock_redis.delete.assert_not_called()
+        state = SleepState.model_validate_json(mock_redis.set.call_args[0][1])
+        assert state.deep_seconds > 0

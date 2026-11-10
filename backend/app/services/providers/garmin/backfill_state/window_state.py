@@ -45,7 +45,7 @@ def get_anchor_timestamp(user_id: str | UUID) -> datetime:
     """Return the fixed anchor timestamp used for window date calculation."""
     val = get_redis_client().get(_get_key(str(user_id), "window", "anchor_ts"))
     if val:
-        return datetime.fromisoformat(val)  # ty:ignore[invalid-argument-type]
+        return datetime.fromisoformat(val)
     return datetime.now(timezone.utc)
 
 

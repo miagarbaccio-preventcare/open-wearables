@@ -37,8 +37,8 @@ def set_trace_id(user_id: str | UUID) -> str:
 def get_trace_id(user_id: str | UUID, data_type: str | None = None) -> str | None:
     """Return the active backfill trace ID for a user, optionally per-type."""
     if data_type:
-        return get_redis_client().get(_get_key(user_id, "types", data_type, "trace_id"))  # ty:ignore[invalid-return-type]
-    return get_redis_client().get(_get_key(user_id, "trace_id"))  # ty:ignore[invalid-return-type]
+        return get_redis_client().get(_get_key(user_id, "types", data_type, "trace_id"))
+    return get_redis_client().get(_get_key(user_id, "trace_id"))
 
 
 def set_type_trace_id(user_id: str | UUID, data_type: str) -> str:
@@ -88,7 +88,7 @@ def release_backfill_lock(user_id: str | UUID, token: str | None = None) -> bool
     lock_key = _get_key(uid, "lock")
     token_key = _get_key(uid, "lock_token")
     if token is None:
-        token = get_redis_client().get(token_key)  # ty:ignore[invalid-assignment]
+        token = get_redis_client().get(token_key)
     if not token:
         return False
     result = bool(get_redis_client().eval(_RELEASE_LUA, 1, lock_key, token))
@@ -170,9 +170,9 @@ def get_backfill_status(user_id: str | UUID) -> dict[str, Any]:
         for dt in BACKFILL_DATA_TYPES:
             key = f"{REDIS_PREFIX}:{uid}:w:{w}:{dt}:status"
             state = get_redis_client().get(key) or "pending"
-            window_states[dt] = state  # ty:ignore[invalid-assignment]
+            window_states[dt] = state
             if state in summary[dt]:
-                summary[dt][state] += 1  # ty:ignore[invalid-argument-type]
+                summary[dt][state] += 1
         windows[str(w)] = window_states
 
     if current_window < total_windows:

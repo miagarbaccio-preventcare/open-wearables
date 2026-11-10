@@ -11,6 +11,7 @@ dependency) so Cloud Run multi-instance SSE still works.
 
 from __future__ import annotations
 
+import builtins
 import json
 import logging
 import re
@@ -45,7 +46,7 @@ def _redis_glob_to_like(pattern: str) -> str:
             out.append("%")
         elif ch == "?":
             out.append("_")
-        elif ch in ("%","_"):
+        elif ch in ("%", "_"):
             out.append("\\" + ch)
         else:
             out.append(ch)
@@ -65,9 +66,7 @@ class _SqlLock:
         self._client = client
         self.name = name
         self.timeout = float(timeout)
-        self.blocking_timeout = (
-            None if blocking_timeout is None else float(blocking_timeout)
-        )
+        self.blocking_timeout = None if blocking_timeout is None else float(blocking_timeout)
         self.local = threading.local()
         self.local.token = None
 
@@ -163,11 +162,7 @@ class _PubSub:
         ignore_subscribe_messages: bool | None = None,
         timeout: float = 0.0,
     ) -> dict[str, Any] | None:
-        ignore = (
-            self.ignore_subscribe_messages
-            if ignore_subscribe_messages is None
-            else ignore_subscribe_messages
-        )
+        ignore = self.ignore_subscribe_messages if ignore_subscribe_messages is None else ignore_subscribe_messages
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
             while self._pending:
@@ -179,9 +174,7 @@ class _PubSub:
             if rows:
                 for row_id, channel, payload in rows:
                     self._last_id = max(self._last_id, row_id)
-                    self._pending.append(
-                        {"type": "message", "channel": channel, "data": payload}
-                    )
+                    self._pending.append({"type": "message", "channel": channel, "data": payload})
                 continue
             if time.monotonic() >= deadline:
                 return None
@@ -217,10 +210,7 @@ class SqlKvClient:
             )
         else:
             conn.execute(
-                text(
-                    "DELETE FROM ephemeral_kv WHERE key = :key "
-                    "AND expires_at IS NOT NULL AND expires_at < :now"
-                ),
+                text("DELETE FROM ephemeral_kv WHERE key = :key AND expires_at IS NOT NULL AND expires_at < :now"),
                 {"key": key, "now": _utcnow()},
             )
 
@@ -326,10 +316,7 @@ class SqlKvClient:
         with self._engine.begin() as conn:
             self._purge_expired(conn, key)
             result = conn.execute(
-                text(
-                    "UPDATE ephemeral_kv SET expires_at = :expires_at, updated_at = :updated_at "
-                    "WHERE key = :key"
-                ),
+                text("UPDATE ephemeral_kv SET expires_at = :expires_at, updated_at = :updated_at WHERE key = :key"),
                 {"key": key, "expires_at": self._expires_at(seconds), "updated_at": _utcnow()},
             )
             return bool(result.rowcount)
@@ -362,14 +349,10 @@ class SqlKvClient:
             for k in key_list:
                 self._purge_expired(conn, k)
             rows = conn.execute(
-                text(
-                    "SELECT key, kind, value_json FROM ephemeral_kv WHERE key = ANY(:keys)"
-                ),
+                text("SELECT key, kind, value_json FROM ephemeral_kv WHERE key = ANY(:keys)"),
                 {"keys": key_list},
             ).fetchall()
-            by_key = {
-                r[0]: (str(r[2]) if r[1] == _KIND_STRING else None) for r in rows
-            }
+            by_key = {r[0]: (str(r[2]) if r[1] == _KIND_STRING else None) for r in rows}
             return [by_key.get(k) for k in key_list]
 
     def compare_delete(self, key: str, expected: str) -> bool:
@@ -394,9 +377,7 @@ class SqlKvClient:
             or _RELEASE_LUA_SNIPPET.replace(" ", "") in compact
         )
         if not supported:
-            raise NotImplementedError(
-                "SqlKvClient.eval only supports compare-and-delete lock release scripts"
-            )
+            raise NotImplementedError("SqlKvClient.eval only supports compare-and-delete lock release scripts")
         keys = list(keys_and_args[:numkeys])
         args = list(keys_and_args[numkeys:])
         if len(keys) != 1 or len(args) != 1:
@@ -445,7 +426,7 @@ class SqlKvClient:
                 conn.execute(text("DELETE FROM ephemeral_kv WHERE key = :key"), {"key": key})
             return before - len(current)
 
-    def smembers(self, key: str) -> set[str]:
+    def smembers(self, key: str) -> builtins.set[str]:
         with self._engine.begin() as conn:
             row = self._read_row(conn, key)
             if not row or row[0] != _KIND_SET:
@@ -545,9 +526,7 @@ class SqlKvClient:
             )
             # Opportunistic GC: keep last ~24h
             conn.execute(
-                text(
-                    "DELETE FROM ephemeral_pubsub WHERE created_at < :cutoff"
-                ),
+                text("DELETE FROM ephemeral_pubsub WHERE created_at < :cutoff"),
                 {"cutoff": _utcnow() - timedelta(hours=24)},
             )
         return 1
@@ -557,9 +536,7 @@ class SqlKvClient:
             row = conn.execute(text("SELECT COALESCE(MAX(id), 0) FROM ephemeral_pubsub")).fetchone()
             return int(row[0]) if row else 0
 
-    def _pubsub_fetch(
-        self, channels: set[str], after_id: int, limit: int = 50
-    ) -> list[tuple[int, str, str]]:
+    def _pubsub_fetch(self, channels: builtins.set[str], after_id: int, limit: int = 50) -> list[tuple[int, str, str]]:
         if not channels:
             return []
         with self._engine.begin() as conn:
