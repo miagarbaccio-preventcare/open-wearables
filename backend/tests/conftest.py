@@ -10,6 +10,7 @@ Following patterns from know-how-tests.md:
 import os
 import sys
 from collections.abc import Generator
+from contextlib import ExitStack
 from typing import Any
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
@@ -22,6 +23,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from testcontainers.postgres import PostgresContainer
 from testcontainers.redis import RedisContainer
 
+from app import database as app_database
 from app.config import settings
 from app.database import BaseDbModel, _get_db_dependency
 from app.integrations.redis_client import get_redis_client
@@ -34,6 +36,46 @@ from tests import factories
 os.environ["ENV"] = "test"
 os.environ["SECRET_KEY"] = "test-secret-key-for-testing-only"
 os.environ["MASTER_KEY"] = "dGVzdC1tYXN0ZXIta2V5LWZvci10ZXN0aW5nLW9ubHk="  # base64 test key
+
+# PreventCare runs Open Wearables with no Memorystore at all: ephemeral state
+# and the Celery broker both live in Cloud SQL. gcp/open-wearables/provision.sh
+# does not provision Redis, both Cloud Run services set ephemeral_backend=sql
+# and celery_broker_backend=sql, and gcp/cost-optimize.sh records the
+# Memorystore deletion as already done.
+#
+# The suite used to require a live Redis for every test regardless, because the
+# fixtures below were unconditional and autouse — so the deployed Redis-free
+# configuration was the one configuration the tests could not run in. Default to
+# the production posture instead; set TEST_EPHEMERAL_BACKEND=redis to exercise
+# the Redis client itself.
+_TEST_EPHEMERAL_BACKEND = os.environ.get("TEST_EPHEMERAL_BACKEND", "sql").strip().lower()
+_TEST_USES_REDIS = _TEST_EPHEMERAL_BACKEND != "sql"
+
+# ephemeral_kv / ephemeral_pubsub come from migration pc_ephemeral_kv_001 and
+# have no SQLAlchemy model, so metadata.create_all does not build them. Mirror
+# that migration here or the sql backend has nothing to read or write.
+_EPHEMERAL_STORE_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS ephemeral_kv (
+        key TEXT PRIMARY KEY,
+        kind VARCHAR(16) NOT NULL,
+        value_json JSONB NOT NULL,
+        expires_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_ephemeral_kv_expires_at ON ephemeral_kv (expires_at)",
+    """
+    CREATE TABLE IF NOT EXISTS ephemeral_pubsub (
+        id BIGSERIAL PRIMARY KEY,
+        channel TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_ephemeral_pubsub_channel_id ON ephemeral_pubsub (channel, id)",
+    "CREATE INDEX IF NOT EXISTS ix_ephemeral_pubsub_created_at ON ephemeral_pubsub (created_at)",
+)
 
 
 @pytest.fixture(scope="session")
@@ -69,6 +111,10 @@ def engine(_postgres_url: str) -> Any:
         max_overflow=10,
     )
     BaseDbModel.metadata.create_all(bind=test_engine)
+
+    with test_engine.begin() as conn:
+        for statement in _EPHEMERAL_STORE_DDL:
+            conn.execute(text(statement))
 
     # Seed series type definitions (these need to exist for foreign key constraints)
     with Session(bind=test_engine) as session:
@@ -168,6 +214,11 @@ def _redis_url() -> Generator[str, None, None]:
     - If TEST_REDIS_URL is set (e.g. in CI), use it directly.
     - Otherwise, spin up a Redis container via testcontainers.
     """
+    if not _TEST_USES_REDIS:
+        # Redis-free mode: nothing to start and nothing to connect to.
+        yield ""
+        return
+
     explicit_url = os.environ.get("TEST_REDIS_URL")
     if explicit_url:
         yield explicit_url
@@ -180,29 +231,49 @@ def _redis_url() -> Generator[str, None, None]:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _configure_redis(_redis_url: str) -> Generator[None, None, None]:
+def _configure_redis(_redis_url: str, engine: Any) -> Generator[None, None, None]:
     """
-    Point app settings at the test Redis instance for the whole session.
+    Point the ephemeral store at test infrastructure for the whole session.
 
     Uses patch.object instead of env vars because settings is already
     instantiated from config/.env at import time.
     """
-    parsed = urlparse(_redis_url)
-    with (
-        patch.object(settings, "redis_host", parsed.hostname or "localhost"),
-        patch.object(settings, "redis_port", parsed.port or 6379),
-    ):
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(settings, "ephemeral_backend", _TEST_EPHEMERAL_BACKEND))
+        if _TEST_USES_REDIS:
+            parsed = urlparse(_redis_url)
+            stack.enter_context(patch.object(settings, "redis_host", parsed.hostname or "localhost"))
+            stack.enter_context(patch.object(settings, "redis_port", parsed.port or 6379))
+        else:
+            # get_redis_client builds SqlKvClient(app.database.engine) via a
+            # lazy import, so without this it would dial whatever Postgres
+            # config/.env points at rather than the test container.
+            stack.enter_context(patch.object(app_database, "engine", engine))
+        get_redis_client.cache_clear()
         yield
+        get_redis_client.cache_clear()
 
 
 @pytest.fixture(autouse=True)
-def flush_redis(_redis_url: str) -> Generator[None, None, None]:
-    """Flush Redis state before each test to ensure isolation."""
-    redis_lib.from_url(_redis_url).flushdb()
-    get_redis_client.cache_clear()
+def flush_redis(_redis_url: str, engine: Any) -> Generator[None, None, None]:
+    """Reset ephemeral state before and after each test to ensure isolation.
+
+    SqlKvClient commits on its own connection from the pool, outside the ``db``
+    fixture's rolled-back transaction, so the sql backend needs an explicit
+    truncate to get the isolation that flushdb() gives the Redis backend.
+    """
+
+    def _reset() -> None:
+        if _TEST_USES_REDIS:
+            redis_lib.from_url(_redis_url).flushdb()
+        else:
+            with engine.begin() as conn:
+                conn.execute(text("TRUNCATE ephemeral_kv, ephemeral_pubsub"))
+        get_redis_client.cache_clear()
+
+    _reset()
     yield
-    redis_lib.from_url(_redis_url).flushdb()
-    get_redis_client.cache_clear()
+    _reset()
 
 
 # ============================================================================

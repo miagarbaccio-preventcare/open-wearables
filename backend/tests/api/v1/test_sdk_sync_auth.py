@@ -88,6 +88,30 @@ class TestSDKSyncWithSDKToken:
 
         assert response.status_code == 401
 
+    def test_a_failed_drain_trigger_still_returns_202(
+        self, client: TestClient, db: Session, api_v1_prefix: str
+    ) -> None:
+        api_key = ApiKeyFactory()
+        user_id = "123e4567-e89b-12d3-a456-426614174000"
+        with (
+            patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
+            patch(
+                "app.api.routes.v1.sdk_sync.trigger_sdk_drain",
+                side_effect=RuntimeError("down"),
+            ),
+        ):
+            response = client.post(
+                f"{api_v1_prefix}/sdk/users/{user_id}/sync/",
+                headers={"X-Open-Wearables-API-Key": api_key.id},
+                json={
+                    "provider": "apple",
+                    "sdkVersion": "1.0.0",
+                    "syncTimestamp": "2026-06-15T12:00:00Z",
+                    "data": {"records": [], "sleep": [], "workouts": []},
+                },
+            )
+        assert response.status_code == 202
+
 
 def _resting_hr_records(count: int) -> list[dict]:
     return [
@@ -103,7 +127,7 @@ def _resting_hr_records(count: int) -> list[dict]:
 
 
 class TestSDKSyncInlineImport:
-    """Small batches import in the request; the rest are queued."""
+    """Small batches import in the request; the rest wait for the drain job."""
 
     def _post(self, client: TestClient, api_v1_prefix: str, records: list[dict]) -> httpx.Response:
         api_key = ApiKeyFactory()
@@ -119,7 +143,7 @@ class TestSDKSyncInlineImport:
             },
         )
 
-    def test_a_small_batch_imports_without_the_queue(
+    def test_a_small_batch_imports_without_the_drain_job(
         self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
     ) -> None:
         with (
@@ -179,21 +203,6 @@ class TestSDKSyncInlineImport:
         mock_celery_tasks.assert_not_called()
         mock_celery_tasks.delay.assert_called_once()
         trigger.assert_called_once()
-
-    def test_a_failed_drain_trigger_still_returns_202(
-        self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
-    ) -> None:
-        with (
-            patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
-            patch(
-                "app.api.routes.v1.sdk_sync.trigger_sdk_drain",
-                side_effect=RuntimeError("down"),
-            ),
-        ):
-            response = self._post(client, api_v1_prefix, [])
-
-        assert response.status_code == 202
-        mock_celery_tasks.delay.assert_called_once()
 
 
 class TestSDKTokenBlockedElsewhere:
