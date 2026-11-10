@@ -130,6 +130,13 @@ class _Pipeline:
         self._ops.append(("set", (key, value), {"ex": ex}))
         return self
 
+    def get(self, key: str) -> "_Pipeline":
+        # sync_status_service.get_run_summaries batches run lookups through a
+        # pipeline, so a missing get() here surfaced as a 500 on
+        # GET /users/{id}/sync/runs under ephemeral_backend=sql.
+        self._ops.append(("get", (key,), {}))
+        return self
+
     def publish(self, channel: str, message: str) -> "_Pipeline":
         self._ops.append(("publish", (channel, message), {}))
         return self
@@ -320,6 +327,22 @@ class SqlKvClient:
                 {"key": key, "expires_at": self._expires_at(seconds), "updated_at": _utcnow()},
             )
             return bool(result.rowcount)
+
+    def ttl(self, key: str) -> int:
+        """Seconds remaining, with Redis semantics: -2 missing, -1 no expiry."""
+        with self._engine.begin() as conn:
+            self._purge_expired(conn, key)
+            row = conn.execute(
+                text("SELECT expires_at FROM ephemeral_kv WHERE key = :key"),
+                {"key": key},
+            ).fetchone()
+            if row is None:
+                return -2
+            if row[0] is None:
+                return -1
+            remaining = (row[0] - _utcnow()).total_seconds()
+            # Still present means not yet expired, so never report 0 here.
+            return max(1, int(remaining))
 
     def incr(self, key: str) -> int:
         with self._engine.begin() as conn:

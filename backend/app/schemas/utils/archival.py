@@ -25,7 +25,7 @@ class ArchivalSettingUpdate(BaseModel):
         None,
         ge=1,
         le=3650,
-        description="Days before live data is archived. NULL to disable archival.",
+        description="Rejected with 400 — archival is unsupported. Must be NULL.",
     )
     delete_after_days: int | None = Field(
         None,

@@ -136,6 +136,10 @@ class DataPointSeriesArchiveRepository:
     def archive_data_before(self, db: DbSession, cutoff_date: date) -> int:
         """Aggregate live rows older than *cutoff_date* into the archive table.
 
+        Nothing calls this: the daily job refuses to archive because the reads
+        need the intraday rows this deletes. See ``ARCHIVAL_UNSUPPORTED_DETAIL``
+        in ``archival_service`` before wiring it back up.
+
         For each (data_source_id, series_type_definition_id, date):
         1. Compute the aggregate value using the type's AggregationMethod (sum/avg/max).
         2. UPSERT into archive table (on conflict → update with re-calculated value).
