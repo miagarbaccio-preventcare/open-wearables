@@ -967,6 +967,50 @@ class EventRecordRepository(
             .first()
         )
 
+    @handle_exceptions
+    def find_sleep_records_in_window(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+        threshold_minutes: int,
+        source: str | None = None,
+        provider: str | None = None,
+    ) -> list[EventRecord]:
+        """Return every sleep session adjacent to [start_time, end_time].
+
+        Same window and provider rules as ``find_adjacent_sleep_record``. The
+        caller merges and deletes these rows in one transaction.
+        """
+        threshold = timedelta(minutes=threshold_minutes)
+        filters = [
+            DataSource.user_id == user_id,
+            self.model.category == "sleep",
+            self.model.type == "sleep_session",
+            self.model.start_datetime <= end_time + threshold,
+            self.model.end_datetime >= start_time - threshold,
+        ]
+        if provider is not None:
+            filters.append(DataSource.provider == provider)
+        if source is not None:
+            filters.append(DataSource.source == source)
+        return (
+            db_session.query(self.model)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .options(selectinload(self.model.detail))
+            .filter(*filters)
+            .order_by(self.model.start_datetime.asc())
+            .with_for_update()
+            .all()
+        )
+
+    def delete_by_ids(self, db_session: DbSession, record_ids: list[UUID]) -> None:
+        """Delete records in one statement. The caller commits."""
+        if not record_ids:
+            return
+        db_session.query(self.model).filter(self.model.id.in_(record_ids)).delete(synchronize_session=False)
+
     def get_sleep_records_with_details(
         self,
         db_session: DbSession,

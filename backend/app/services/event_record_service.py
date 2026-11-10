@@ -202,6 +202,25 @@ class EventRecordService(
             db_session, user_id, start_time, end_time, threshold_minutes, source=source, provider=provider
         )
 
+    def find_sleep_records_in_window(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+        threshold_minutes: int,
+        source: str | None = None,
+        provider: str | None = None,
+    ) -> list[EventRecord]:
+        """Load every sleep session adjacent to the window. Caller commits."""
+        return self.crud.find_sleep_records_in_window(
+            db_session, user_id, start_time, end_time, threshold_minutes, source=source, provider=provider
+        )
+
+    def delete_by_ids(self, db_session: DbSession, record_ids: list[UUID]) -> None:
+        """Delete records in one statement. Caller commits."""
+        self.crud.delete_by_ids(db_session, record_ids)
+
     def create_or_merge_sleep(
         self,
         db_session: DbSession,
