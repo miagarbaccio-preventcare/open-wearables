@@ -1,7 +1,7 @@
 """API endpoints for data lifecycle / archival settings.
 
-Admin-only endpoints to configure when live time-series data is archived
-(aggregated into daily rows) and when old data is permanently deleted.
+Admin-only endpoints to configure when old data is permanently deleted. Archival
+itself is refused — see ``ARCHIVAL_UNSUPPORTED_DETAIL`` in ``archival_service``.
 """
 
 from logging import getLogger
@@ -36,9 +36,10 @@ def get_archival_settings(
     status_code=status.HTTP_200_OK,
     summary="Update data lifecycle settings",
     description=(
-        "Configure archive_after_days (when live data is aggregated) and "
-        "delete_after_days (when old data is permanently removed). "
-        "Set to null to disable."
+        "Configure delete_after_days (when old data is permanently removed); "
+        "null keeps data indefinitely. archive_after_days is rejected with 400 — "
+        "aggregating samples into daily rows discards the intraday data the read "
+        "paths depend on."
     ),
 )
 def update_archival_settings(
@@ -52,8 +53,11 @@ def update_archival_settings(
 @router.post(
     "/settings/archival/run",
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Trigger archival job manually",
-    description="Dispatches the daily archival + retention job via Celery. Returns immediately with the task ID.",
+    summary="Trigger the lifecycle job manually",
+    description=(
+        "Dispatches the daily retention job via Celery. Returns immediately with the task ID. "
+        "Archival is refused, so this only applies delete_after_days."
+    ),
 )
 def trigger_archival(
     _developer: DeveloperDep,

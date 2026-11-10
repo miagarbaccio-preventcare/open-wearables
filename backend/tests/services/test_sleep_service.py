@@ -655,7 +655,8 @@ class TestSDKSyncEndpointSleep:
         assert response.status_code == 202
         data = response.json()
         assert data["status_code"] == 202
-        mock_task.delay.assert_called_once()
+        # A small batch imports in the request; a large one is queued.
+        assert mock_task.call_count + mock_task.delay.call_count == 1
 
     def test_sync_endpoint_accepts_detailed_stages(
         self,

@@ -902,3 +902,123 @@ class TestDataPointSeriesRepository:
         by_source = {r["source"]: r["steps_sum"] for r in result}
         assert by_source["garmin"] == 10000
         assert by_source["apple"] == 8000
+        flagged = {r["source"]: r["steps_from_daily_total"] for r in result}
+        assert flagged["garmin"] is True
+        assert flagged["apple"] is False
+
+    def _vital(
+        self,
+        user_id: UUID,
+        recorded_at: datetime,
+        zone_offset: str,
+        value: float,
+        series_type: SeriesType,
+    ) -> TimeSeriesSampleCreate:
+        return TimeSeriesSampleCreate(
+            id=uuid4(),
+            user_id=user_id,
+            source="apple",
+            device_model="watch",
+            recorded_at=recorded_at,
+            zone_offset=zone_offset,
+            value=value,
+            series_type=series_type,
+        )
+
+    def test_aggregate_averages_resting_hrv_and_spo2_on_the_local_day(
+        self, db: Session, series_repo: DataPointSeriesRepository
+    ) -> None:
+        """The local day comes from the sample offset, and a vitals-only day has no steps.
+
+        04:30Z on New Year's Day with a -05:00 offset is still the previous local year.
+        06:30Z on the spring-forward morning with a -04:00 offset is that local morning,
+        not the previous date. Both are calendar dates, not a duration stepped backward.
+        """
+        user = UserFactory()
+        samples = [
+            self._vital(
+                user.id,
+                datetime(2026, 1, 1, 4, 30, tzinfo=timezone.utc),
+                "-05:00",
+                50,
+                SeriesType.resting_heart_rate,
+            ),
+            self._vital(
+                user.id,
+                datetime(2026, 1, 1, 4, 45, tzinfo=timezone.utc),
+                "-05:00",
+                60,
+                SeriesType.resting_heart_rate,
+            ),
+            self._vital(
+                user.id,
+                datetime(2026, 1, 1, 4, 30, tzinfo=timezone.utc),
+                "-05:00",
+                40,
+                SeriesType.heart_rate_variability_sdnn,
+            ),
+            self._vital(
+                user.id,
+                datetime(2026, 1, 1, 4, 45, tzinfo=timezone.utc),
+                "-05:00",
+                50,
+                SeriesType.heart_rate_variability_sdnn,
+            ),
+            self._vital(
+                user.id,
+                datetime(2026, 1, 1, 4, 30, tzinfo=timezone.utc),
+                "-05:00",
+                0.96,
+                SeriesType.oxygen_saturation,
+            ),
+            self._vital(
+                user.id,
+                datetime(2026, 1, 1, 4, 45, tzinfo=timezone.utc),
+                "-05:00",
+                0.98,
+                SeriesType.oxygen_saturation,
+            ),
+            self._vital(
+                user.id,
+                datetime(2026, 3, 8, 6, 30, tzinfo=timezone.utc),
+                "-04:00",
+                62,
+                SeriesType.resting_heart_rate,
+            ),
+            self._vital(
+                user.id,
+                datetime(2026, 3, 8, 6, 30, tzinfo=timezone.utc),
+                "-04:00",
+                30,
+                SeriesType.heart_rate_variability_sdnn,
+            ),
+            self._vital(
+                user.id,
+                datetime(2026, 3, 8, 6, 30, tzinfo=timezone.utc),
+                "-04:00",
+                97,
+                SeriesType.oxygen_saturation,
+            ),
+        ]
+        series_repo.bulk_create(db, samples)
+        db.commit()
+
+        result = series_repo.get_daily_activity_aggregates(
+            db,
+            user.id,
+            datetime(2025, 12, 31, tzinfo=timezone.utc),
+            datetime(2026, 3, 9, tzinfo=timezone.utc),
+        )
+
+        by_date = {r["activity_date"].isoformat(): r for r in result}
+        assert set(by_date) == {"2025-12-31", "2026-03-08"}
+        year_end = by_date["2025-12-31"]
+        assert year_end["steps_sum"] is None
+        assert year_end["resting_heart_rate_avg"] == 55
+        assert year_end["hrv_sdnn_avg"] == 45
+        assert year_end["spo2_avg"] == pytest.approx(0.97)
+        spring = by_date["2026-03-08"]
+        assert spring["steps_sum"] is None
+        assert spring["resting_heart_rate_avg"] == 62
+        assert spring["hrv_sdnn_avg"] == 30
+        assert spring["spo2_avg"] == 97

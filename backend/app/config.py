@@ -204,6 +204,12 @@ class Settings(BaseSettings):
 
     xml_chunk_size: int = 50_000
 
+    # SDK uploads at or under this many items are imported inside the request
+    # instead of queued. A new account's six months is about 2,300 items and
+    # imports in a second or two; the queued path waits for a drain job to
+    # start. 0 queues everything.
+    sdk_inline_max_items: int = 5_000
+
     # RAW PAYLOAD STORAGE
     raw_payload_storage: str = "disabled"  # disabled | log | s3
     raw_payload_max_size_bytes: int = 10 * 1024 * 1024  # 10 MB

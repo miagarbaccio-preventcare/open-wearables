@@ -700,6 +700,10 @@ class DataPointSeriesRepository(
         - steps_sum, active_energy_sum, basal_energy_sum
         - hr_avg, hr_max, hr_min
         - distance_sum, flights_climbed_sum
+        - resting_heart_rate_avg, hrv_sdnn_avg, spo2_avg (None when that series is absent)
+
+        A missing step sum stays None. A day that only has resting heart rate,
+        HRV, or blood oxygen must not be reported as zero steps.
         """
         # Series type IDs we need
         steps_id = get_series_type_id(SeriesType.steps)
@@ -709,6 +713,9 @@ class DataPointSeriesRepository(
         distance_id = get_series_type_id(SeriesType.distance_walking_running)
         flights_id = get_series_type_id(SeriesType.flights_climbed)
         active_time_id = get_series_type_id(SeriesType.active_time)
+        resting_id = get_series_type_id(SeriesType.resting_heart_rate)
+        hrv_id = get_series_type_id(SeriesType.heart_rate_variability_sdnn)
+        spo2_id = get_series_type_id(SeriesType.oxygen_saturation)
 
         local_date = cast(
             self.model.recorded_at + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
@@ -769,6 +776,21 @@ class DataPointSeriesRepository(
                 prefer_daily_sum(flights_id).label("flights_climbed_sum"),
                 # Provider-reported active time (minutes) - daily total (NULL when no data)
                 prefer_daily_sum(active_time_id).label("active_time_sum"),
+                func.avg(
+                    case((self.model.series_type_definition_id == resting_id, self.model.value), else_=None)
+                ).label("resting_hr_avg"),
+                func.avg(
+                    case((self.model.series_type_definition_id == hrv_id, self.model.value), else_=None)
+                ).label("hrv_sdnn_avg"),
+                func.avg(
+                    case((self.model.series_type_definition_id == spo2_id, self.model.value), else_=None)
+                ).label("spo2_avg"),
+                func.bool_or(
+                    and_(
+                        self.model.series_type_definition_id == steps_id,
+                        self.model.is_daily_total.is_(True),
+                    )
+                ).label("steps_from_daily_total"),
             )
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
@@ -777,7 +799,18 @@ class DataPointSeriesRepository(
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
                 self.model.series_type_definition_id.in_(
-                    [steps_id, energy_id, basal_energy_id, hr_id, distance_id, flights_id, active_time_id]
+                    [
+                        steps_id,
+                        energy_id,
+                        basal_energy_id,
+                        hr_id,
+                        distance_id,
+                        flights_id,
+                        active_time_id,
+                        resting_id,
+                        hrv_id,
+                        spo2_id,
+                    ]
                 ),
             )
             .group_by(
@@ -799,7 +832,7 @@ class DataPointSeriesRepository(
                     "provider": row.provider,
                     "source": row.source,
                     "device_model": row.device_model,
-                    "steps_sum": int(row.steps_sum) if row.steps_sum else 0,
+                    "steps_sum": int(row.steps_sum) if row.steps_sum is not None else None,
                     "active_energy_sum": float(row.active_energy_sum) if row.active_energy_sum else 0.0,
                     "basal_energy_sum": float(row.basal_energy_sum) if row.basal_energy_sum else 0.0,
                     "hr_avg": int(round(float(row.hr_avg))) if row.hr_avg is not None else None,
@@ -810,6 +843,12 @@ class DataPointSeriesRepository(
                     if row.flights_climbed_sum is not None
                     else None,
                     "active_time_minutes": int(row.active_time_sum) if row.active_time_sum is not None else None,
+                    "steps_from_daily_total": bool(row.steps_from_daily_total),
+                    "resting_heart_rate_avg": int(round(float(row.resting_hr_avg)))
+                    if row.resting_hr_avg is not None
+                    else None,
+                    "hrv_sdnn_avg": float(row.hrv_sdnn_avg) if row.hrv_sdnn_avg is not None else None,
+                    "spo2_avg": float(row.spo2_avg) if row.spo2_avg is not None else None,
                 }
             )
         return aggregates
