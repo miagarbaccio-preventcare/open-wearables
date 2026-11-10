@@ -636,9 +636,7 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         # Remove the old record before creating the merged one (cascade deletes detail).
         event_record_service.delete(db_session, adjacent.id)
 
-    sleep_record, detail = _build_sleep_record_and_detail(
-        user_id, state, metrics, cleaned_stages, start_time, end_time
-    )
+    sleep_record, detail = _build_sleep_record_and_detail(user_id, state, metrics, cleaned_stages, start_time, end_time)
 
     try:
         created_or_existing_record = event_record_service.create(db_session, sleep_record)
